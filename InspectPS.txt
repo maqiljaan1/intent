@@ -1,0 +1,1174 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    InspectPS - a single-file Windows UI Automation inspector and pattern runner.
+.DESCRIPTION
+    Select a control with Ctrl+Shift+F8 while pointing at it, with the delayed
+    picker, or in the lazy-loaded desktop tree. Inspect its properties, choose
+    a supported pattern and method, supply typed parameters, and run it.
+
+    Everything ships in this .ps1. No modules, SDK, downloads, or installation
+    are required. Windows PowerShell 5.1 / .NET Framework is required. A small
+    embedded C# class provides only Win32 hotkeys and a non-activating outline.
+    The inspector UI, automation engine, method discovery, and parameter
+    conversion are PowerShell. UI Automation runs in a separate MTA PowerShell
+    process. The GUI stays responsive if an application provider blocks.
+
+    Pattern coverage is whatever the .NET Framework UIAutomationClient exposes
+    for the selected element: Invoke, Value, RangeValue, Toggle, ExpandCollapse,
+    Selection/SelectionItem, Scroll/ScrollItem, Window, Transform, Dock,
+    Grid/GridItem, Table/TableItem, MultipleView, Text, and other managed
+    patterns if available. Methods are discovered, not limited to that list.
+    This is NOT a full native Inspect.exe clone: MSAA/LegacyIAccessible,
+    native-only newer UIA pattern extensions, event tracing, and custom COM
+    patterns are not implemented. A provider can report a pattern and still
+    refuse an operation because of its current state or permissions.
+
+    QUICK START
+      powershell.exe -NoProfile -STA -File .\InspectPS.ps1
+      1. Hover a target control and press Ctrl+Shift+F8 (no click is sent).
+         Or press 'Pick in 3s' and move the pointer to a control.
+      2. Open the Patterns tab, choose a pattern and a method.
+      3. Fill in parameters and press Run method. Results appear in the log.
+      4. Refresh to observe changes. Refresh branch reloads tree children.
+
+    PARAMETER EXAMPLES
+      InvokePattern.Invoke()                         no parameters
+      ValuePattern.SetValue(value)                   text, including empty text
+      RangeValuePattern.SetValue(value)              decimal, e.g. 42.5
+      TogglePattern.Toggle()                         no parameters
+      ExpandCollapsePattern.Expand()                 no parameters
+      SelectionItemPattern.Select()                  no parameters
+      ScrollPattern.Scroll(horizontalAmount,
+                           verticalAmount)           enum dropdowns
+      ScrollPattern.SetScrollPercent(horizontalPercent,
+                                     verticalPercent) 0..100; -1 = unchanged
+      WindowPattern.SetWindowVisualState(state)       Normal/Minimized/Maximized
+      TransformPattern.Move(x, y)                     physical screen coordinates
+      GridPattern.GetItem(row, column)                zero-based indexes
+      SelectionPattern.Current.GetSelection()        selected element references
+      TablePattern.Current.GetRowHeaders()           row-header references
+      TextPattern.DocumentRange [get]                returns a saved text range
+      TextPatternRange.GetText(maxLength)             -1 for all text
+
+    OBJECT PARAMETERS AND RESULTS
+      Selected controls and returned UIA objects receive session references
+      such as @e12 (element) and @r13 (text range). Use these in element or range
+      parameter fields. References appear in the Objects tab. Double-click an
+      element to inspect it or a text range to explore its methods.
+      @selected resolves to the element selected WHEN RUN IS PRESSED.
+      @null passes a null reference only for element/range/object parameters.
+      A Point is x,y using decimal points. An AutomationTextAttribute accepts
+      a TextPattern field name such as FontNameAttribute or its numeric ID.
+      Object values use text (default), str:text, int:42, double:1.5, bool:true,
+      or an @reference. No parameter is executed as PowerShell code.
+
+    RECOVERY / LIMITS
+      Stale element: pick it again. Provider state can change at any time.
+      Busy provider: dismiss any modal target dialog or press Reset worker.
+      Reset loses session references. It does not undo a completed action,
+      and cannot guarantee cancellation of an action already sent to a target.
+      Tree loading is per branch, bounded by MaxChildren (default 300).
+      Numeric inputs use '.' as the decimal separator, without thousands commas.
+      Password text is not read automatically. Explicit actions are user driven.
+      Target must expose UI Automation. Canvas/game pixels are not controls.
+      For an elevated target, launch this tool at the same permitted integrity
+      level. Secure desktops are outside scope. Follow your organization's
+      PowerShell execution and application-control policy; the script does not
+      change it or request elevation. Constrained Language may block Add-Type.
+
+    VALIDATION
+      powershell.exe -NoProfile -MTA -File .\InspectPS.ps1 -SelfTest
+      Launches a disposable demo window, tests actual Invoke/Value/Toggle
+      behavior against it, then closes it. No other application is modified.
+      powershell.exe -NoProfile -STA -File .\InspectPS.ps1 -Demo
+      Opens the same demo for interactive testing.
+
+    REFERENCES
+      https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.getsupportedpatterns
+      https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading
+      https://learn.microsoft.com/en-us/windows/win32/winauto/inspect-objects
+.PARAMETER MaxChildren
+    Maximum children loaded per tree branch. Raise for very large tables.
+.PARAMETER Demo
+    Open a harmless demo application for interactive inspection.
+.PARAMETER SelfTest
+    Run integration checks against the included demo. Requires -MTA.
+.NOTES
+    Version 1.0. Windows PowerShell 5.1. No external dependencies.
+#>
+[CmdletBinding()]
+param(
+    [ValidateRange(10, 10000)][int]$MaxChildren = 300,
+    [switch]$Demo,
+    [switch]$SelfTest,
+    [switch]$Worker,
+    [int]$OwnerProcessId = 0
+)
+
+$ErrorActionPreference = 'Stop'
+if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop') {
+    throw 'Run this file on Windows using Windows PowerShell 5.1: powershell.exe -NoProfile -STA -File .\InspectPS.ps1'
+}
+$script:ThisFile = $PSCommandPath
+$script:PowerShellExe = Join-Path $PSHOME 'powershell.exe'
+$script:Invariant = [Globalization.CultureInfo]::InvariantCulture
+
+function Get-ErrorMessage($Failure) {
+    $ex = $Failure.Exception
+    if ($null -eq $ex) { return [string]$Failure }
+    while ($null -ne $ex.InnerException) { $ex = $ex.InnerException }
+    return ('{0}: {1}' -f $ex.GetType().Name, $ex.Message)
+}
+
+function Import-Automation {
+    Add-Type -AssemblyName @('UIAutomationClient', 'UIAutomationTypes', 'WindowsBase')
+}
+
+# All functions in this section are used only by the MTA automation process.
+function Initialize-AutomationEngine {
+    Import-Automation
+    $script:Objects = @{}
+    $script:ElementKeys = @{}
+    $script:NextObjectId = 0
+    $script:SelectedRef = ''
+    $script:TextAttributes = @{}
+    foreach ($field in [System.Windows.Automation.TextPattern].GetFields([Reflection.BindingFlags]'Public,Static')) {
+        if ($field.FieldType -eq [System.Windows.Automation.AutomationTextAttribute]) {
+            $script:TextAttributes[$field.Name] = $field.GetValue($null)
+        }
+    }
+}
+
+function Save-AutomationObject($Value) {
+    $key = $null
+    $prefix = 'o'
+    if ($Value -is [System.Windows.Automation.AutomationElement]) {
+        $prefix = 'e'
+        try { $key = ($Value.GetRuntimeId() -join '.') } catch { }
+        if ($key -and $script:ElementKeys.ContainsKey($key)) {
+            $ref = $script:ElementKeys[$key]
+            $script:Objects[$ref] = $Value
+            return $ref
+        }
+    } elseif ($Value -is [System.Windows.Automation.Text.TextPatternRange]) {
+        $prefix = 'r'
+    }
+    $script:NextObjectId++
+    $ref = '@{0}{1}' -f $prefix, $script:NextObjectId
+    $script:Objects[$ref] = $Value
+    if ($key) { $script:ElementKeys[$key] = $ref }
+    return $ref
+}
+
+function Resolve-AutomationObject([string]$Reference) {
+    if ($Reference -eq '@selected') { $Reference = $script:SelectedRef }
+    if ($Reference -eq '@null') { return $null }
+    if (-not $Reference -or -not $script:Objects.ContainsKey($Reference)) {
+        throw "Unknown reference '$Reference'. Pick the element again or use a reference from the Objects tab."
+    }
+    # A unary comma preserves arrays and other enumerable return values.
+    return ,$script:Objects[$Reference]
+}
+
+function Get-ElementSummary($Element) {
+    $ref = Save-AutomationObject $Element
+    try {
+        $c = $Element.Current
+        $name = [string]$c.Name
+        if ($name.Length -gt 120) { $name = $name.Substring(0, 120) + '...' }
+        $type = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+        return [pscustomobject]@{
+            Ref = $ref; Name = $name; ControlType = $type
+            AutomationId = $c.AutomationId; ProcessId = $c.ProcessId
+            Label = ('{0}  {1}  [{2}]' -f $type, ($name -replace '[\r\n]+', ' '), $ref)
+        }
+    } catch {
+        return [pscustomobject]@{ Ref = $ref; Name = ''; ControlType = 'Unavailable'; AutomationId = ''; ProcessId = 0; Label = "$ref (element unavailable)" }
+    }
+}
+
+function Format-AutomationValue($Value, [int]$Depth = 0) {
+    if ($null -eq $Value) { return '<null>' }
+    if ([object]::ReferenceEquals($Value, [System.Windows.Automation.AutomationElement]::NotSupported)) { return '<not supported>' }
+    if ([object]::ReferenceEquals($Value, [System.Windows.Automation.TextPattern]::MixedAttributeValue)) { return '<mixed attribute>' }
+    if ($Value -is [System.Windows.Automation.AutomationElement]) { return (Get-ElementSummary $Value).Label }
+    if ($Value -is [System.Windows.Automation.Text.TextPatternRange]) { return ('{0} (TextPatternRange)' -f (Save-AutomationObject $Value)) }
+    if ($Value -is [System.Windows.Automation.AutomationIdentifier]) { return ('{0} ({1})' -f $Value.ProgrammaticName, $Value.Id) }
+    if ($Value -is [Array] -or $Value -is [System.Windows.Automation.AutomationElementCollection]) {
+        if ($Depth -ge 3) { return '<nested collection>' }
+        $items = @(); $count = 0
+        foreach ($item in $Value) {
+            if ($count -ge 300) { $items += '<remaining items omitted>'; break }
+            $items += Format-AutomationValue $item ($Depth + 1)
+            $count++
+        }
+        return '[' + ($items -join '; ') + ']'
+    }
+    if ($Value -is [IFormattable]) { return $Value.ToString($null, $script:Invariant) }
+    return [string]$Value
+}
+
+function Get-ParameterDescription([Reflection.ParameterInfo]$Parameter) {
+    $t = $Parameter.ParameterType
+    $kind = 'Text'; $choices = @(); $default = ''; $hint = ''; $supported = $true
+    if ($t.IsEnum) {
+        $kind = 'Choice'; $choices = @([Enum]::GetNames($t)); $default = $choices[0]
+        if ($choices -contains 'NoAmount') { $default = 'NoAmount' }
+    } elseif ($t -eq [bool]) {
+        $kind = 'Choice'; $choices = @('False', 'True'); $default = 'False'
+    } elseif ($t -eq [string]) {
+        $hint = 'Literal text; an empty field passes an empty string.'
+    } elseif ($t -eq [int] -or $t -eq [double] -or $t -eq [long]) {
+        $default = '0'; $hint = 'Number; decimal point is a dot.'
+        if ($Parameter.Name -eq 'maxLength') { $default = '-1'; $hint = '-1 = all text; otherwise a maximum character count.' }
+        if ($Parameter.Name -match 'Percent$') { $default = '-1'; $hint = '0 through 100; -1 leaves this axis unchanged.' }
+        if ($Parameter.Name -match '^(row|column)$') { $hint = 'Zero-based index.' }
+        if ($Parameter.Name -match 'milliseconds') { $default = '1000'; $hint = 'Timeout in milliseconds.' }
+    } elseif ($t -eq [System.Windows.Point]) {
+        $default = '0,0'; $hint = 'Physical screen coordinates: x,y (supports negative monitor coordinates).'
+    } elseif ($t -eq [System.Windows.Automation.AutomationElement]) {
+        $default = '@selected'; $hint = 'An @e reference from Objects, @selected, or @null.'
+    } elseif ($t -eq [System.Windows.Automation.Text.TextPatternRange]) {
+        $hint = 'An @r reference from Objects. Get DocumentRange or GetSelection first.'
+    } elseif ($t -eq [System.Windows.Automation.AutomationTextAttribute]) {
+        $kind = 'EditableChoice'; $choices = @($script:TextAttributes.Keys | Sort-Object)
+        $default = 'FontNameAttribute'; $hint = 'TextPattern attribute field name or numeric attribute ID.'
+    } elseif ($t -eq [object]) {
+        $hint = 'Literal string, str:text, int:42, double:1.5, bool:true, @reference, or @null.'
+    } else {
+        $supported = $false; $hint = 'This parameter type is not supported by the generic editor.'
+    }
+    return [pscustomobject]@{
+        Name = $Parameter.Name; Type = $t.FullName; Kind = $kind
+        Choices = $choices; Default = $default; Hint = $hint; Supported = $supported
+    }
+}
+
+function Get-CurrentProperty([type]$Type) {
+    # TablePattern hides GridPattern.Current with a different return type.
+    # Name-only GetProperty can throw AmbiguousMatchException in that case.
+    for ($level = $Type; $null -ne $level; $level = $level.BaseType) {
+        $property = $level.GetProperty('Current', [Reflection.BindingFlags]'Public,Instance,DeclaredOnly')
+        if ($null -ne $property) { return $property }
+    }
+    return $null
+}
+
+function Get-MethodDescriptions([type]$Type, [switch]$SkipCurrent) {
+    $items = @()
+    foreach ($method in $Type.GetMethods([Reflection.BindingFlags]'Public,Instance')) {
+        if ($method.DeclaringType.FullName -in @('System.Object', 'System.ValueType', 'System.Windows.Automation.BasePattern')) { continue }
+        if ($method.IsSpecialName -or $method.ContainsGenericParameters) { continue }
+        $parameters = @($method.GetParameters() | ForEach-Object { Get-ParameterDescription $_ })
+        $items += [pscustomobject]@{
+            Token = $method.MetadataToken; Name = $method.Name; Kind = 'Method'; Scope = 'Direct'
+            Label = '{0}({1})' -f $method.Name, (($parameters | ForEach-Object { $_.Name + ': ' + ($_.Type -replace '^.*\.', '') }) -join ', ')
+            ReturnType = $method.ReturnType.FullName; Parameters = $parameters
+            Supported = (@($parameters | Where-Object { -not $_.Supported }).Count -eq 0)
+        }
+    }
+    foreach ($prop in $Type.GetProperties([Reflection.BindingFlags]'Public,Instance')) {
+        if ($prop.Name -in @('Current', 'Cached') -or $prop.GetIndexParameters().Length -ne 0) { continue }
+        $getter = $prop.GetGetMethod()
+        if ($null -eq $getter) { continue }
+        $items += [pscustomobject]@{
+            Token = $getter.MetadataToken; Name = $prop.Name; Kind = 'Property'; Scope = 'Direct'
+            Label = $prop.Name + ' [get]'; ReturnType = $prop.PropertyType.FullName
+            Parameters = @(); Supported = $true
+        }
+    }
+    if (-not $SkipCurrent) {
+        $current = Get-CurrentProperty $Type
+        if ($null -ne $current) {
+            foreach ($method in @(Get-MethodDescriptions $current.PropertyType -SkipCurrent)) {
+                if ($method.Kind -ne 'Method') { continue }
+                $method.Scope = 'Current'; $method.Label = 'Current.' + $method.Label
+                $items += $method
+            }
+        }
+    }
+    return @($items | Sort-Object Label)
+}
+
+function Convert-MethodParameter([string]$Text, [type]$Type) {
+    if ($Type -eq [string]) { return [string]$Text }
+    $trimmed = $Text.Trim()
+    if ($Type.IsEnum) {
+        if (-not ([Enum]::GetNames($Type) -contains $trimmed)) { throw "Choose a named $($Type.Name) value." }
+        return [Enum]::Parse($Type, $trimmed, $true)
+    }
+    if ($Type -eq [bool]) { return [bool]::Parse($trimmed) }
+    if ($Type -eq [int]) { return [int]::Parse($trimmed, [Globalization.NumberStyles]::Integer, $script:Invariant) }
+    if ($Type -eq [long]) { return [long]::Parse($trimmed, [Globalization.NumberStyles]::Integer, $script:Invariant) }
+    if ($Type -eq [double]) {
+        $number = [double]::Parse($trimmed, [Globalization.NumberStyles]::Float, $script:Invariant)
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { throw 'Use a finite number.' }
+        return $number
+    }
+    if ($Type -eq [System.Windows.Point]) {
+        $xy = $trimmed.Split(',')
+        if ($xy.Length -ne 2) { throw 'A Point must be x,y using decimal points, for example -100,250.5.' }
+        return [System.Windows.Point]::new((Convert-MethodParameter $xy[0] ([double])), (Convert-MethodParameter $xy[1] ([double])))
+    }
+    if ($Type -eq [System.Windows.Automation.AutomationElement] -or $Type -eq [System.Windows.Automation.Text.TextPatternRange]) {
+        $value = Resolve-AutomationObject $trimmed
+        if ($null -ne $value -and -not $Type.IsInstanceOfType($value)) { throw "$trimmed is not a $($Type.Name)." }
+        return ,$value
+    }
+    if ($Type -eq [System.Windows.Automation.AutomationTextAttribute]) {
+        if ($script:TextAttributes.ContainsKey($trimmed)) { return $script:TextAttributes[$trimmed] }
+        $id = Convert-MethodParameter $trimmed ([int])
+        $attribute = [System.Windows.Automation.AutomationTextAttribute]::LookupById($id)
+        if ($null -eq $attribute) { throw "Unknown text attribute ID: $id" }
+        return $attribute
+    }
+    if ($Type -eq [object]) {
+        if ($trimmed.StartsWith('@')) { return ,(Resolve-AutomationObject $trimmed) }
+        if ($Text -match '^str:([\s\S]*)$') { return $Matches[1] }
+        if ($Text -match '^(int|double|bool):([\s\S]*)$') {
+            $typeName = $Matches[1]; $payload = $Matches[2]
+            $types = @{ int = [int]; double = [double]; bool = [bool] }
+            return Convert-MethodParameter $payload $types[$typeName]
+        }
+        return [string]$Text
+    }
+    throw "Unsupported parameter type: $($Type.FullName)"
+}
+
+function Get-AutomationWalker([string]$View) {
+    switch ($View) {
+        'Raw' { return [System.Windows.Automation.TreeWalker]::RawViewWalker }
+        'Content' { return [System.Windows.Automation.TreeWalker]::ContentViewWalker }
+        default { return [System.Windows.Automation.TreeWalker]::ControlViewWalker }
+    }
+}
+
+function Get-ElementInspection($Element) {
+    $summary = Get-ElementSummary $Element
+    if ($summary.ControlType -eq 'Unavailable') { throw 'The element is no longer available. Pick it again.' }
+    $script:SelectedRef = $summary.Ref
+    $properties = @(); $seen = @{}
+    $isPassword = [bool]$Element.Current.IsPassword
+    foreach ($prop in $Element.GetSupportedProperties()) {
+        if ($seen.ContainsKey($prop.Id)) { continue }; $seen[$prop.Id] = $true
+        try {
+            if ($isPassword -and $prop.ProgrammaticName -match '(ValuePattern.*ValueProperty|Text)') {
+                $formatted = '<password property not read>'
+            } else {
+                $formatted = Format-AutomationValue ($Element.GetCurrentPropertyValue($prop, $true))
+            }
+        } catch { $formatted = '<' + (Get-ErrorMessage $_) + '>' }
+        $properties += [pscustomobject]@{ Name = $prop.ProgrammaticName; Value = $formatted; Id = $prop.Id }
+    }
+    try { $runtimeId = $Element.GetRuntimeId() -join ',' } catch { $runtimeId = '<unavailable>' }
+    $properties += [pscustomobject]@{ Name = 'RuntimeId'; Value = $runtimeId; Id = 0 }
+    $patterns = @()
+    foreach ($pattern in $Element.GetSupportedPatterns()) {
+        $patterns += [pscustomobject]@{ Id = $pattern.Id; Name = $pattern.ProgrammaticName -replace 'Identifiers\.Pattern$', '' }
+    }
+    $rect = $Element.Current.BoundingRectangle
+    $bounds = $null
+    if (-not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+        $bounds = @{ X = $rect.X; Y = $rect.Y; Width = $rect.Width; Height = $rect.Height }
+    }
+    return [pscustomobject]@{
+        Summary = $summary; Properties = @($properties | Sort-Object Name)
+        Patterns = @($patterns | Sort-Object Name); Bounds = $bounds
+        IsPassword = $isPassword
+    }
+}
+
+function Get-TargetPattern([string]$ElementRef, [int]$PatternId) {
+    $element = Resolve-AutomationObject $ElementRef
+    $id = [System.Windows.Automation.AutomationPattern]::LookupById($PatternId)
+    if ($null -eq $id) { throw "This managed UIA version does not expose pattern ID $PatternId." }
+    return $element.GetCurrentPattern($id)
+}
+
+function Get-PatternInspection($Target) {
+    $properties = @()
+    $currentProp = Get-CurrentProperty ($Target.GetType())
+    if ($null -ne $currentProp) {
+        $current = $currentProp.GetValue($Target, $null)
+        foreach ($prop in $current.GetType().GetProperties()) {
+            try {
+                $formatted = Format-AutomationValue ($prop.GetValue($current, $null))
+            } catch { $formatted = '<' + (Get-ErrorMessage $_) + '>' }
+            $properties += [pscustomobject]@{ Name = $prop.Name; Value = $formatted }
+        }
+    }
+    return [pscustomobject]@{
+        Type = $Target.GetType().FullName
+        Methods = @(Get-MethodDescriptions ($Target.GetType()))
+        Properties = @($properties | Sort-Object Name)
+    }
+}
+
+function Invoke-EngineRequest($Request) {
+    switch ([string]$Request.Op) {
+        'Hello' { return @{ Ready = $true; Apartment = [Threading.Thread]::CurrentThread.ApartmentState.ToString() } }
+        'Root' {
+            return Get-ElementSummary ([System.Windows.Automation.AutomationElement]::RootElement)
+        }
+        'Children' {
+            $element = Resolve-AutomationObject $Request.Ref
+            $walker = Get-AutomationWalker $Request.View
+            $child = $walker.GetFirstChild($element)
+            $items = @(); $seen = @{}; $walked = 0
+            while ($null -ne $child -and $walked -lt $MaxChildren) {
+                $walked++
+                $summary = Get-ElementSummary $child
+                if ($seen.ContainsKey($summary.Ref)) { throw 'The provider returned a cycle while enumerating children.' }
+                $seen[$summary.Ref] = $true
+                if ($summary.ProcessId -ne $OwnerProcessId -and $summary.ProcessId -ne $PID) { $items += $summary }
+                $child = $walker.GetNextSibling($child)
+            }
+            return @{ Items = $items; Truncated = ($null -ne $child) }
+        }
+        'Pick' {
+            $point = [System.Windows.Point]::new([double]$Request.X, [double]$Request.Y)
+            $element = [System.Windows.Automation.AutomationElement]::FromPoint($point)
+            if ($null -eq $element) { throw 'No accessible element at this screen point.' }
+            if ($element.Current.ProcessId -in @($OwnerProcessId, $PID)) { throw 'Point at a control in the target application, outside InspectPS.' }
+            return Get-ElementInspection $element
+        }
+        'Inspect' { return Get-ElementInspection (Resolve-AutomationObject $Request.Ref) }
+        'Parent' {
+            $walker = Get-AutomationWalker $Request.View
+            $parent = $walker.GetParent((Resolve-AutomationObject $Request.Ref))
+            if ($null -eq $parent) { throw 'This element has no parent in the selected tree view.' }
+            return Get-ElementInspection $parent
+        }
+        'Focus' {
+            (Resolve-AutomationObject $Request.Ref).SetFocus()
+            return @{ Text = 'SetFocus completed.' }
+        }
+        'Pattern' {
+            $element = Resolve-AutomationObject $Request.Ref
+            if ($element.Current.IsPassword -and [int]$Request.PatternId -eq [System.Windows.Automation.ValuePattern]::Pattern.Id) {
+                $target = Get-TargetPattern $Request.Ref $Request.PatternId
+                return @{ Type = $target.GetType().FullName; Methods = @(Get-MethodDescriptions ($target.GetType())); Properties = @(@{ Name = 'Value'; Value = '<password value not read>' }) }
+            }
+            return Get-PatternInspection (Get-TargetPattern $Request.Ref $Request.PatternId)
+        }
+        'Range' {
+            $range = Resolve-AutomationObject $Request.Ref
+            if ($range -isnot [System.Windows.Automation.Text.TextPatternRange]) { throw 'Choose a text range reference.' }
+            return Get-PatternInspection $range
+        }
+        'Invoke' {
+            # Bind the request's selection, not a later GUI selection.
+            $script:SelectedRef = [string]$Request.SelectedRef
+            if ($Request.TargetKind -eq 'Range') { $target = Resolve-AutomationObject $Request.Ref }
+            else { $target = Get-TargetPattern $Request.Ref $Request.PatternId }
+            $scope = [string]$Request.Scope
+            if (-not $scope) { $scope = 'Direct' }
+            $description = @(Get-MethodDescriptions ($target.GetType()) | Where-Object { $_.Token -eq [int]$Request.Token -and $_.Scope -eq $scope })
+            if ($description.Count -ne 1 -or -not $description[0].Supported) { throw 'Method is no longer available or its parameter types are unsupported.' }
+            $invokeTarget = $target
+            if ($scope -eq 'Current') {
+                $currentProperty = Get-CurrentProperty ($target.GetType())
+                $invokeTarget = $currentProperty.GetValue($target, $null)
+            }
+            $method = @($invokeTarget.GetType().GetMethods([Reflection.BindingFlags]'Public,Instance') | Where-Object { $_.MetadataToken -eq [int]$Request.Token })[0]
+            $parameterInfo = $method.GetParameters()
+            $inputArgs = @($Request.Arguments)
+            if ($inputArgs.Count -ne $parameterInfo.Length) { throw 'The parameter count does not match the method signature.' }
+            $converted = [object[]]::new($parameterInfo.Length)
+            for ($i = 0; $i -lt $parameterInfo.Length; $i++) {
+                try { $converted[$i] = Convert-MethodParameter ([string]$inputArgs[$i]) $parameterInfo[$i].ParameterType }
+                catch { throw ('Parameter {0}: {1}' -f $parameterInfo[$i].Name, (Get-ErrorMessage $_)) }
+            }
+            $result = $method.Invoke($invokeTarget, $converted)
+            $display = 'Completed (no return value).'
+            if ($method.ReturnType -ne [void]) { $display = Format-AutomationValue $result }
+            return @{ Text = $display; Method = $description[0].Label; ReturnType = $method.ReturnType.FullName }
+        }
+        'Objects' {
+            $items = @()
+            foreach ($ref in @($script:Objects.Keys | Sort-Object { [int]($_ -replace '\D', '') })) {
+                $obj = $script:Objects[$ref]
+                $kind = 'Object'; $label = $obj.GetType().Name
+                if ($obj -is [System.Windows.Automation.AutomationElement]) { $kind = 'Element'; $label = (Get-ElementSummary $obj).Label }
+                elseif ($obj -is [System.Windows.Automation.Text.TextPatternRange]) { $kind = 'Range'; $label = 'TextPatternRange' }
+                $items += @{ Ref = $ref; Kind = $kind; Label = $label }
+            }
+            return @{ Items = $items }
+        }
+        default { throw "Unknown engine operation: $($Request.Op)" }
+    }
+}
+
+if ($Worker) {
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'MTA') { throw 'Internal automation worker requires -MTA.' }
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    Initialize-AutomationEngine
+    while ($null -ne ($line = [Console]::ReadLine())) {
+        try {
+            $request = ConvertFrom-Json -InputObject $line
+            $data = Invoke-EngineRequest $request
+            $response = @{ Ok = $true; Data = $data }
+        } catch { $response = @{ Ok = $false; Error = Get-ErrorMessage $_ } }
+        $json = ConvertTo-Json -InputObject $response -Depth 16 -Compress
+        [Console]::WriteLine($json)
+        [Console]::Out.Flush()
+    }
+    return
+}
+
+function Start-ThisScriptProcess([string]$Arguments, [switch]$Redirect) {
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $script:PowerShellExe
+    $info.Arguments = '-NoProfile -NonInteractive ' + $Arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    if ($Redirect) {
+        $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    }
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
+    [void]$process.Start()
+    if ($Redirect) {
+        # Match the worker's Unicode input without a leading BOM.
+        $process.StandardInput.AutoFlush = $true
+    }
+    return $process
+}
+
+if ($SelfTest) {
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'MTA') { throw 'Use powershell.exe -NoProfile -MTA -File .\InspectPS.ps1 -SelfTest' }
+    Initialize-AutomationEngine
+    $demoProcess = Start-ThisScriptProcess ('-STA -File "{0}" -Demo' -f $script:ThisFile)
+    try {
+        $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$demoProcess.Id)
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $window = $null; $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ($null -eq $window -and [DateTime]::UtcNow -lt $deadline) {
+            if ($demoProcess.HasExited) { throw 'Demo process exited before the test could start.' }
+            $window = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $condition)
+            if ($null -eq $window) { Start-Sleep -Milliseconds 150 }
+        }
+        if ($null -eq $window) { throw 'Demo window did not appear within 20 seconds.' }
+        function Find-DemoControl([string]$Name) {
+            $filter = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+            $el = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $filter)
+            if ($null -eq $el) { throw "Demo control missing: $Name" }
+            return $el
+        }
+        function Invoke-DemoPattern($Element, $Pattern, [string]$MethodName, [object[]]$Values) {
+            $ref = Save-AutomationObject $Element
+            $target = Get-TargetPattern $ref $Pattern.Id
+            $method = @(Get-MethodDescriptions ($target.GetType()) | Where-Object { $_.Name -eq $MethodName })[0]
+            if ($null -eq $method) { throw "Method discovery failed: $MethodName" }
+            return Invoke-EngineRequest ([pscustomobject]@{ Op = 'Invoke'; Ref = $ref; PatternId = $Pattern.Id; Token = $method.Token; Scope = $method.Scope; TargetKind = 'Pattern'; SelectedRef = $ref; Arguments = $Values })
+        }
+        $edit = Find-DemoControl 'Demo text'
+        $testValue = "Test 'quotes', decimal 42.5, Unicode: $([char]0x00F1)$([char]0x6C34)"
+        $null = Invoke-DemoPattern $edit ([System.Windows.Automation.ValuePattern]::Pattern) 'SetValue' @($testValue)
+        if ($edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne $testValue) { throw 'Value.SetValue did not preserve text.' }
+        Write-Output 'PASS Value.SetValue: text and Unicode round trip.'
+        $null = Invoke-DemoPattern $edit ([System.Windows.Automation.ValuePattern]::Pattern) 'SetValue' @('')
+        if ($edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne '') { throw 'Empty-string parameter failed.' }
+        Write-Output 'PASS Value.SetValue: empty string.'
+        $check = Find-DemoControl 'Demo checkbox'
+        $before = $check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+        $null = Invoke-DemoPattern $check ([System.Windows.Automation.TogglePattern]::Pattern) 'Toggle' @()
+        if ($check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq $before) { throw 'Toggle did not change state.' }
+        Write-Output 'PASS Toggle.Toggle: checked state changed.'
+        $button = Find-DemoControl 'Increment demo counter'
+        $null = Invoke-DemoPattern $button ([System.Windows.Automation.InvokePattern]::Pattern) 'Invoke' @()
+        $counterChanged = $false; $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $counterChanged -and [DateTime]::UtcNow -lt $deadline) {
+            try { $null = Find-DemoControl 'Clicks: 1'; $counterChanged = $true }
+            catch { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $counterChanged) { throw 'Invoke did not update the demo counter within 5 seconds.' }
+        Write-Output 'PASS Invoke.Invoke: button handler changed the counter.'
+        $inspection = Get-ElementInspection $button
+        if (@($inspection.Patterns).Count -eq 0 -or @($inspection.Properties).Count -eq 0) { throw 'Inspection did not discover properties and patterns.' }
+        Write-Output 'PASS Discovery: selected element exposes properties and patterns.'
+        Write-Output 'All Windows integration checks passed.'
+    } finally {
+        if (-not $demoProcess.HasExited) { $demoProcess.Kill(); [void]$demoProcess.WaitForExit(3000) }
+        $demoProcess.Dispose()
+    }
+    return
+}
+
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    throw 'The GUI requires STA. Use: powershell.exe -NoProfile -STA -File .\InspectPS.ps1'
+}
+Add-Type -AssemblyName @('System.Windows.Forms', 'System.Drawing')
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+if ($Demo) {
+    $demoForm = [Windows.Forms.Form]::new()
+    $demoForm.Text = 'InspectPS Demo'; $demoForm.Size = [Drawing.Size]::new(620, 450)
+    $demoForm.StartPosition = 'CenterScreen'; $demoForm.Font = [Drawing.Font]::new('Segoe UI', 10)
+    $flow = [Windows.Forms.FlowLayoutPanel]::new(); $flow.Dock = 'Fill'; $flow.Padding = [Windows.Forms.Padding]::new(20)
+    $flow.FlowDirection = 'TopDown'; $flow.WrapContents = $false
+    $demoForm.Controls.Add($flow)
+    $intro = [Windows.Forms.Label]::new(); $intro.Text = 'Use InspectPS to change these disposable controls.'; $intro.AutoSize = $true
+    $flow.Controls.Add($intro)
+    $demoText = [Windows.Forms.TextBox]::new(); $demoText.Name = 'DemoText'; $demoText.AccessibleName = 'Demo text'; $demoText.Width = 480; $demoText.Text = 'Change me with Value.SetValue'
+    $flow.Controls.Add($demoText)
+    $demoCheck = [Windows.Forms.CheckBox]::new(); $demoCheck.Name = 'DemoCheck'; $demoCheck.AccessibleName = 'Demo checkbox'; $demoCheck.Text = 'Toggle me'; $demoCheck.AutoSize = $true
+    $flow.Controls.Add($demoCheck)
+    $demoButton = [Windows.Forms.Button]::new(); $demoButton.AccessibleName = 'Increment demo counter'; $demoButton.Text = 'Increment counter'; $demoButton.AutoSize = $true
+    $flow.Controls.Add($demoButton)
+    $script:DemoClicks = 0
+    $demoCounter = [Windows.Forms.Label]::new(); $demoCounter.Text = 'Clicks: 0'; $demoCounter.AutoSize = $true
+    $flow.Controls.Add($demoCounter)
+    $demoButton.Add_Click({ $script:DemoClicks++; $demoCounter.Text = 'Clicks: ' + $script:DemoClicks })
+    $demoCombo = [Windows.Forms.ComboBox]::new(); $demoCombo.AccessibleName = 'Demo choices'; $demoCombo.DropDownStyle = 'DropDownList'; $demoCombo.Width = 260
+    $demoCombo.Items.AddRange([object[]]@('Alpha', 'Beta', 'Gamma')); $demoCombo.SelectedIndex = 0
+    $flow.Controls.Add($demoCombo)
+    $demoSlider = [Windows.Forms.TrackBar]::new(); $demoSlider.AccessibleName = 'Demo slider'; $demoSlider.Maximum = 100; $demoSlider.Value = 25; $demoSlider.Width = 480
+    $flow.Controls.Add($demoSlider)
+    [Windows.Forms.Application]::Run($demoForm)
+    $demoForm.Dispose()
+    return
+}
+
+# Only native window plumbing is compiled; no automation logic is hidden here.
+if (-not ('InspectPS.NativeForm' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace InspectPS {
+    public class NativeForm : Form {
+        [DllImport("user32.dll", SetLastError=true)] static extern bool RegisterHotKey(IntPtr h, int id, uint modifiers, uint key);
+        [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+        [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
+        public event EventHandler PickHotKey;
+        public bool RegisterPicker() { return RegisterHotKey(Handle, 1, 0x4006, 0x77); }
+        public static void EnableDpi() { SetProcessDPIAware(); }
+        public static Point CursorPoint() { POINT p; if (!GetCursorPos(out p)) throw new InvalidOperationException("Cannot read cursor position."); return new Point(p.X, p.Y); }
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x0312 && m.WParam.ToInt32() == 1 && PickHotKey != null) PickHotKey(this, EventArgs.Empty);
+            base.WndProc(ref m);
+        }
+        protected override void OnHandleDestroyed(EventArgs e) { UnregisterHotKey(Handle, 1); base.OnHandleDestroyed(e); }
+    }
+    public class OutlineForm : Form {
+        public OutlineForm() {
+            FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
+            TopMost = true; BackColor = Color.Magenta; TransparencyKey = Color.Magenta;
+            StartPosition = FormStartPosition.Manual;
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x080800A0; return p; } }
+        protected override void OnPaint(PaintEventArgs e) { using (var pen = new Pen(Color.OrangeRed, 4)) e.Graphics.DrawRectangle(pen, 2, 2, Math.Max(0, Width-5), Math.Max(0, Height-5)); }
+    }
+}
+'@
+}
+[InspectPS.NativeForm]::EnableDpi()
+
+$script:Engine = $null; $script:Pending = $null; $script:ReadTask = $null
+$script:ErrorTask = $null; $script:InputWriter = $null
+$script:Inspection = $null; $script:ActionTarget = $null; $script:PatternData = $null
+$script:ParameterEditors = @(); $script:SuppressSelection = $false
+$script:PickAt = $null; $script:OutlineUntil = [DateTime]::MinValue
+$script:WorkerReady = $false; $script:Resetting = $false
+
+function New-Button([string]$Text, [scriptblock]$Click) {
+    $button = [Windows.Forms.Button]::new(); $button.Text = $Text; $button.AutoSize = $true
+    $button.Height = 30; $button.Margin = [Windows.Forms.Padding]::new(3)
+    if ($null -ne $Click) { $button.Add_Click($Click) }
+    return $button
+}
+function New-Grid {
+    $grid = [Windows.Forms.DataGridView]::new(); $grid.Dock = 'Fill'
+    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false
+    $grid.RowHeadersVisible = $false; $grid.AutoSizeColumnsMode = 'Fill'
+    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
+    $grid.BackgroundColor = [Drawing.Color]::White; $grid.BorderStyle = 'None'
+    return $grid
+}
+function Add-Log([string]$Text) {
+    if ($logBox.TextLength -gt 150000) { $logBox.Text = $logBox.Text.Substring($logBox.TextLength - 100000) }
+    $logBox.AppendText(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Text) + [Environment]::NewLine)
+    $logBox.SelectionStart = $logBox.TextLength; $logBox.ScrollToCaret()
+}
+function Set-Status([string]$Text) { $statusLabel.Text = $Text }
+
+$form = [InspectPS.NativeForm]::new()
+$form.Text = 'InspectPS - UI Automation Inspector'
+$form.Size = [Drawing.Size]::new(1220, 860); $form.MinimumSize = [Drawing.Size]::new(920, 680)
+$form.StartPosition = 'CenterScreen'; $form.Font = [Drawing.Font]::new('Segoe UI', 9)
+$form.AutoScaleMode = 'Dpi'
+$outline = [InspectPS.OutlineForm]::new()
+
+$layout = [Windows.Forms.TableLayoutPanel]::new(); $layout.Dock = 'Fill'; $layout.ColumnCount = 1; $layout.RowCount = 5
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 42))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 140))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 28))
+$form.Controls.Add($layout)
+$toolbar = [Windows.Forms.FlowLayoutPanel]::new(); $toolbar.Dock = 'Fill'; $toolbar.AutoSize = $true; $toolbar.Padding = [Windows.Forms.Padding]::new(4)
+$layout.Controls.Add($toolbar, 0, 0)
+$selectionLabel = [Windows.Forms.Label]::new(); $selectionLabel.Dock = 'Fill'; $selectionLabel.Padding = [Windows.Forms.Padding]::new(10, 7, 5, 0)
+$selectionLabel.Text = 'Pick a control with Ctrl+Shift+F8, or expand Desktop to browse controls.'; $selectionLabel.AutoEllipsis = $true
+$layout.Controls.Add($selectionLabel, 0, 1)
+$split = [Windows.Forms.SplitContainer]::new(); $split.Dock = 'Fill'; $split.Size = [Drawing.Size]::new(1100, 500)
+$split.SplitterDistance = 360; $split.Panel1MinSize = 220; $split.Panel2MinSize = 380
+$layout.Controls.Add($split, 0, 2)
+$tree = [Windows.Forms.TreeView]::new(); $tree.Dock = 'Fill'; $tree.HideSelection = $false; $tree.ShowNodeToolTips = $true
+$split.Panel1.Controls.Add($tree)
+$tabs = [Windows.Forms.TabControl]::new(); $tabs.Dock = 'Fill'; $split.Panel2.Controls.Add($tabs)
+$propertyTab = [Windows.Forms.TabPage]::new('Properties'); $patternTab = [Windows.Forms.TabPage]::new('Patterns')
+$objectsTab = [Windows.Forms.TabPage]::new('Objects'); $helpTab = [Windows.Forms.TabPage]::new('Help')
+$tabs.TabPages.AddRange([Windows.Forms.TabPage[]]@($propertyTab, $patternTab, $objectsTab, $helpTab))
+$propertyGrid = New-Grid
+[void]$propertyGrid.Columns.Add('Property', 'Property'); [void]$propertyGrid.Columns.Add('Value', 'Value')
+$propertyGrid.Columns[0].FillWeight = 44; $propertyGrid.Columns[1].FillWeight = 56
+$propertyTab.Controls.Add($propertyGrid)
+$logBox = [Windows.Forms.TextBox]::new(); $logBox.Dock = 'Fill'; $logBox.Multiline = $true; $logBox.ReadOnly = $true
+$logBox.ScrollBars = 'Both'; $logBox.WordWrap = $false; $logBox.Font = [Drawing.Font]::new('Consolas', 9)
+$layout.Controls.Add($logBox, 0, 3)
+$statusLabel = [Windows.Forms.Label]::new(); $statusLabel.Dock = 'Fill'; $statusLabel.Padding = [Windows.Forms.Padding]::new(8, 5, 0, 0); $statusLabel.AutoEllipsis = $true
+$layout.Controls.Add($statusLabel, 0, 4)
+
+$patternLayout = [Windows.Forms.TableLayoutPanel]::new(); $patternLayout.Dock = 'Fill'; $patternLayout.RowCount = 6; $patternLayout.ColumnCount = 1
+foreach ($height in @(34, 34, 50)) { [void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, $height)) }
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 60))
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 38))
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 40))
+$patternTab.Controls.Add($patternLayout)
+$patternCombo = [Windows.Forms.ComboBox]::new(); $patternCombo.Dock = 'Fill'; $patternCombo.DropDownStyle = 'DropDownList'; $patternCombo.DisplayMember = 'Name'
+$patternLayout.Controls.Add($patternCombo, 0, 0)
+$methodCombo = [Windows.Forms.ComboBox]::new(); $methodCombo.Dock = 'Fill'; $methodCombo.DropDownStyle = 'DropDownList'; $methodCombo.DisplayMember = 'Label'
+$patternLayout.Controls.Add($methodCombo, 0, 1)
+$methodHint = [Windows.Forms.Label]::new(); $methodHint.Dock = 'Fill'; $methodHint.Text = 'Choose a supported pattern, then a method.'
+$patternLayout.Controls.Add($methodHint, 0, 2)
+$parameterPanel = [Windows.Forms.TableLayoutPanel]::new(); $parameterPanel.Dock = 'Fill'; $parameterPanel.AutoScroll = $true
+$parameterPanel.ColumnCount = 2; $parameterPanel.RowCount = 0
+[void]$parameterPanel.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent, 34))
+[void]$parameterPanel.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent, 66))
+$patternLayout.Controls.Add($parameterPanel, 0, 3)
+$runRow = [Windows.Forms.FlowLayoutPanel]::new(); $runRow.Dock = 'Fill'
+$runButton = New-Button 'Run method' { Invoke-SelectedMethod }; $runButton.Enabled = $false
+$runRow.Controls.Add($runButton)
+$runRow.Controls.Add((New-Button 'Refresh pattern' { Request-SelectedPattern }))
+$patternLayout.Controls.Add($runRow, 0, 4)
+$patternPropertyGrid = New-Grid
+[void]$patternPropertyGrid.Columns.Add('Property', 'Pattern property'); [void]$patternPropertyGrid.Columns.Add('Value', 'Current value')
+$patternLayout.Controls.Add($patternPropertyGrid, 0, 5)
+$toolTip = [Windows.Forms.ToolTip]::new(); $toolTip.AutoPopDelay = 15000
+
+$objectsLayout = [Windows.Forms.TableLayoutPanel]::new(); $objectsLayout.Dock = 'Fill'; $objectsLayout.RowCount = 2; $objectsLayout.ColumnCount = 1
+[void]$objectsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 40))
+[void]$objectsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+$objectsTab.Controls.Add($objectsLayout)
+$objectButtons = [Windows.Forms.FlowLayoutPanel]::new(); $objectButtons.Dock = 'Fill'
+$objectButtons.Controls.Add((New-Button 'Refresh objects' { Request-Objects }))
+$objectButtons.Controls.Add((New-Button 'Open selected object' { Open-SelectedObject }))
+$objectButtons.Controls.Add((New-Button 'Copy reference' {
+    if ($null -ne $objectGrid.CurrentRow) { [Windows.Forms.Clipboard]::SetText([string]$objectGrid.CurrentRow.Cells[0].Value) }
+}))
+$objectsLayout.Controls.Add($objectButtons, 0, 0)
+$objectGrid = New-Grid
+[void]$objectGrid.Columns.Add('Reference', 'Reference'); [void]$objectGrid.Columns.Add('Kind', 'Kind'); [void]$objectGrid.Columns.Add('Description', 'Description')
+$objectGrid.Columns[0].FillWeight = 16; $objectGrid.Columns[1].FillWeight = 16; $objectGrid.Columns[2].FillWeight = 68
+$objectsLayout.Controls.Add($objectGrid, 0, 1)
+$helpBox = [Windows.Forms.TextBox]::new(); $helpBox.Dock = 'Fill'; $helpBox.Multiline = $true; $helpBox.ReadOnly = $true; $helpBox.ScrollBars = 'Vertical'
+$helpBox.Font = [Drawing.Font]::new('Consolas', 10)
+$helpBox.Text = @'
+SELECT
+Hover a target and press Ctrl+Shift+F8. This does not click it.
+Or click Pick in 3s and move the pointer to the target.
+Expand Desktop / a control to load its immediate children.
+Picked controls appear as separate roots for quick exploration.
+Use Parent to walk upward; choose Raw for non-control nodes.
+
+RUN A PATTERN
+Patterns tab -> pattern -> method -> parameters -> Run method.
+Enums and booleans have dropdowns. Numbers use a decimal dot.
+Blank string fields pass empty strings. Methods run only when
+you press Run. They can change data, submit forms, or close windows.
+Results and errors appear in the bottom log. Refresh the control
+or pattern to see updated state; refresh branch after tree changes.
+
+EXAMPLES
+Button: InvokePattern -> Invoke()
+Text box: ValuePattern -> SetValue(value)
+Checkbox: TogglePattern -> Toggle()
+List item: SelectionItemPattern -> Select()
+Combo: ExpandCollapsePattern -> Expand()
+Slider: RangeValuePattern -> SetValue(value)
+Scroller: Scroll -> choose enum amounts or percent (-1 unchanged)
+Window: SetWindowVisualState -> choose Normal/Minimized/Maximized
+Table: GridPattern -> GetItem(row, column), zero-based
+Selection: Current.GetSelection() returns selected elements.
+Table: Current.GetRowHeaders() returns header elements.
+
+TEXT AND OBJECTS
+TextPattern -> DocumentRange [get] creates @r... in the log.
+Objects -> Refresh objects -> double-click that range.
+Choose GetText(-1), FindText, Move, Select, or another method.
+Methods returning elements create @e... references.
+Double-click an element in Objects to inspect it.
+Use @references in object parameter fields. @selected is the
+selected element when Run is pressed; @null is a null reference.
+Object values: literal text, str:text, int:42, double:1.5,
+bool:true, @reference, @null. Inputs are never evaluated as code.
+Point: x,y in physical screen pixels, e.g. -100,250.
+Text attributes: FontNameAttribute or another dropdown entry.
+
+RECOVERY
+If an element vanishes, pick it again.
+If a provider waits on a dialog, respond to the target dialog.
+Reset worker ends only the helper process and clears references.
+It does not undo an action or guarantee its cancellation.
+No method is automatically retried after an error.
+
+SCOPE
+Uses the managed .NET UIAutomationClient API, not every native
+Inspect.exe feature. No MSAA view, native-only modern pattern
+extensions, event tracing, or custom COM patterns.
+Only controls exposed by an application's provider are visible.
+For elevated targets use the same permitted integrity level.
+No SDK/modules; no automatic elevation or policy changes.
+
+Open demo creates a disposable window for trying patterns.
+The script header includes full command-line help and SelfTest.
+'@
+$helpTab.Controls.Add($helpBox)
+
+function Clear-MethodEditor {
+    $runButton.Enabled = $false; $methodCombo.Items.Clear(); $script:ParameterEditors = @()
+    foreach ($control in @($parameterPanel.Controls)) { $control.Dispose() }
+    $parameterPanel.Controls.Clear(); $parameterPanel.RowStyles.Clear(); $parameterPanel.RowCount = 0
+    $patternPropertyGrid.Rows.Clear()
+}
+function Update-BusyControls {
+    $available = ($null -eq $script:Pending -and $script:WorkerReady)
+    $tree.Enabled = $available; $patternCombo.Enabled = $available
+    $methodCombo.Enabled = $available; $parameterPanel.Enabled = $available
+    $viewCombo.Enabled = $available
+    $runButton.Enabled = ($available -and $null -ne $script:PatternData -and $null -ne $methodCombo.SelectedItem -and $methodCombo.SelectedItem.Supported)
+}
+function Stop-Engine {
+    $script:Pending = $null; $script:ReadTask = $null; $script:WorkerReady = $false
+    if ($null -ne $script:Engine) {
+        try { if (-not $script:Engine.HasExited) { $script:Engine.Kill(); [void]$script:Engine.WaitForExit(2000) } } catch { }
+        try { if ($null -ne $script:InputWriter) { $script:InputWriter.Dispose() }; $script:Engine.Dispose() } catch { }
+    }
+    $script:InputWriter = $null; $script:Engine = $null; $script:ErrorTask = $null
+}
+function Start-Engine {
+    Stop-Engine
+    $workerArgs = '-MTA -File "{0}" -Worker -OwnerProcessId {1} -MaxChildren {2}' -f $script:ThisFile, $PID, $MaxChildren
+    $script:Engine = Start-ThisScriptProcess $workerArgs -Redirect
+    $script:InputWriter = [IO.StreamWriter]::new($script:Engine.StandardInput.BaseStream, [Text.UTF8Encoding]::new($false))
+    $script:InputWriter.AutoFlush = $true
+    $script:ErrorTask = $script:Engine.StandardError.ReadToEndAsync()
+    Send-EngineRequest @{ Op = 'Hello' } {
+        param($data)
+        if ($data.Apartment -ne 'MTA') { throw 'Worker did not initialize in MTA.' }
+        $script:WorkerReady = $true
+        Request-Root
+    } 'Starting automation engine'
+}
+function Send-EngineRequest($Request, [scriptblock]$OnSuccess, [string]$Label, [scriptblock]$OnFailure = $null) {
+    if ($null -ne $script:Pending) { Set-Status ('Busy: ' + $script:Pending.Label + '. Wait or use Reset worker.'); return $false }
+    if ($null -eq $script:Engine -or $script:Engine.HasExited) { Add-Log 'Worker is not running. Press Reset worker.'; return $false }
+    try {
+        $json = ConvertTo-Json -InputObject $Request -Depth 12 -Compress
+        $script:InputWriter.WriteLine($json)
+        $script:ReadTask = $script:Engine.StandardOutput.ReadLineAsync()
+        $script:Pending = @{ OnSuccess = $OnSuccess; OnFailure = $OnFailure; Label = $Label; Started = [DateTime]::UtcNow }
+        if ($Request.Op -in @('Pick', 'Inspect', 'Parent')) {
+            # An unsuccessful selection must not leave an old action armed.
+            $script:PatternData = $null; $script:ActionTarget = $null
+        }
+        Update-BusyControls
+        Set-Status ($Label + '...')
+        return $true
+    } catch {
+        $script:Pending = $null
+        Update-BusyControls
+        Add-Log (Get-ErrorMessage $_); Set-Status 'Worker communication failed. Press Reset worker.'
+        if ($null -ne $OnFailure) { & $OnFailure }
+        return $false
+    }
+}
+function Add-ElementNode($Summary, $Collection) {
+    $node = [Windows.Forms.TreeNode]::new([string]$Summary.Label)
+    $node.Tag = [pscustomobject]@{ Ref = [string]$Summary.Ref; Loaded = $false; Loading = $false }
+    $node.ToolTipText = 'AutomationId: ' + $Summary.AutomationId + '; PID: ' + $Summary.ProcessId
+    [void]$node.Nodes.Add([Windows.Forms.TreeNode]::new('Expand to load children'))
+    [void]$Collection.Add($node)
+    return $node
+}
+function Request-Root {
+    [void](Send-EngineRequest @{ Op = 'Root' } {
+        param($data)
+        $script:SuppressSelection = $true
+        $tree.Nodes.Clear(); $node = Add-ElementNode $data $tree.Nodes
+        $script:SuppressSelection = $false
+        $node.Expand()
+    } 'Loading Desktop')
+}
+function Load-TreeChildren($Node) {
+    if ($null -eq $Node.Tag -or $Node.Tag.Loaded -or $Node.Tag.Loading) { return }
+    $targetNode = $Node
+    $callback = {
+        param($data)
+        $targetNode.Nodes.Clear(); $targetNode.Tag.Loaded = $true; $targetNode.Tag.Loading = $false
+        foreach ($item in @($data.Items)) { $null = Add-ElementNode $item $targetNode.Nodes }
+        if ($data.Truncated) { [void]$targetNode.Nodes.Add([Windows.Forms.TreeNode]::new('Limit reached. Relaunch with a larger -MaxChildren.')) }
+        $targetNode.Expand()
+    }.GetNewClosure()
+    $failure = { $targetNode.Tag.Loading = $false }.GetNewClosure()
+    $accepted = Send-EngineRequest @{ Op = 'Children'; Ref = $Node.Tag.Ref; View = [string]$viewCombo.SelectedItem } $callback 'Loading branch' $failure
+    if ($accepted) { $Node.Tag.Loading = $true }
+}
+function Apply-Inspection($Data) {
+    $script:Inspection = $Data; $script:ActionTarget = $null; $script:PatternData = $null
+    $selectionLabel.Text = '{0} | AutomationId: {1} | PID: {2}' -f $Data.Summary.Label, $Data.Summary.AutomationId, $Data.Summary.ProcessId
+    $propertyGrid.Rows.Clear()
+    foreach ($prop in @($Data.Properties)) { [void]$propertyGrid.Rows.Add([object[]]@([string]$prop.Name, [string]$prop.Value)) }
+    $script:SuppressSelection = $true
+    Clear-MethodEditor; $patternCombo.Items.Clear()
+    foreach ($pattern in @($Data.Patterns)) { [void]$patternCombo.Items.Add($pattern) }
+    $methodHint.Text = 'Choose a pattern to load its methods and current state.'
+    if ($patternCombo.Items.Count -eq 0) { $methodHint.Text = 'No managed UI Automation patterns are exposed by this control.' }
+    $script:SuppressSelection = $false
+    Set-Status ('Selected ' + $Data.Summary.Ref + '. Choose a pattern to continue.')
+}
+function Show-PickedInspection($Data) {
+    Apply-Inspection $Data
+    $script:SuppressSelection = $true
+    $existing = @($tree.Nodes | Where-Object { $null -ne $_.Tag -and $_.Tag.Ref -eq $Data.Summary.Ref })
+    if ($existing.Count -gt 0) { $node = $existing[0] } else { $node = Add-ElementNode $Data.Summary $tree.Nodes }
+    $tree.SelectedNode = $node; $node.EnsureVisible()
+    $script:SuppressSelection = $false
+    if ($highlightCheck.Checked) { Show-Outline }
+}
+function Pick-Control {
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation, or use Reset worker.'; return }
+    $outline.Hide()
+    $point = [InspectPS.NativeForm]::CursorPoint()
+    [void](Send-EngineRequest @{ Op = 'Pick'; X = $point.X; Y = $point.Y } { param($data) Show-PickedInspection $data } 'Picking control')
+}
+function Show-Outline {
+    if ($null -eq $script:Inspection -or $null -eq $script:Inspection.Bounds) { return }
+    $b = $script:Inspection.Bounds
+    $outline.Bounds = [Drawing.Rectangle]::new([int][Math]::Floor($b.X), [int][Math]::Floor($b.Y), [Math]::Max(5, [int][Math]::Ceiling($b.Width)), [Math]::Max(5, [int][Math]::Ceiling($b.Height)))
+    $outline.Show(); $outline.Invalidate(); $script:OutlineUntil = [DateTime]::UtcNow.AddMilliseconds(1400)
+}
+function Refresh-Inspection {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $script:Inspection.Summary.Ref } { param($data) Apply-Inspection $data } 'Refreshing control')
+    }
+}
+function Apply-PatternData($Data) {
+    $script:PatternData = $Data
+    $script:SuppressSelection = $true
+    Clear-MethodEditor
+    foreach ($method in @($Data.Methods)) { [void]$methodCombo.Items.Add($method) }
+    foreach ($prop in @($Data.Properties)) { [void]$patternPropertyGrid.Rows.Add([object[]]@([string]$prop.Name, [string]$prop.Value)) }
+    $script:SuppressSelection = $false
+    if ($methodCombo.Items.Count -gt 0) { $methodCombo.SelectedIndex = 0 } else { $methodHint.Text = 'This pattern has properties only; no callable methods.' }
+}
+function Request-SelectedPattern {
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation before choosing a pattern.'; return }
+    $runButton.Enabled = $false; $script:PatternData = $null; $script:ActionTarget = $null
+    $pattern = $patternCombo.SelectedItem
+    if ($null -eq $pattern -or $null -eq $script:Inspection) { return }
+    if ($pattern.Id -eq -1) {
+        $script:ActionTarget = @{ Kind = 'Range'; Ref = $pattern.Ref; PatternId = 0 }
+        [void](Send-EngineRequest @{ Op = 'Range'; Ref = $pattern.Ref } { param($data) Apply-PatternData $data } 'Reading text range methods')
+    } else {
+        $script:ActionTarget = @{ Kind = 'Pattern'; Ref = $script:Inspection.Summary.Ref; PatternId = $pattern.Id }
+        [void](Send-EngineRequest @{ Op = 'Pattern'; Ref = $script:ActionTarget.Ref; PatternId = $pattern.Id } { param($data) Apply-PatternData $data } 'Reading pattern')
+    }
+}
+function Build-ParameterEditor {
+    foreach ($control in @($parameterPanel.Controls)) { $control.Dispose() }
+    $parameterPanel.Controls.Clear(); $parameterPanel.RowStyles.Clear(); $parameterPanel.RowCount = 0
+    $script:ParameterEditors = @(); $runButton.Enabled = $false
+    $method = $methodCombo.SelectedItem
+    if ($null -eq $method) { return }
+    $methodHint.Text = '{0} -> {1}. Hover a parameter for help.' -f $method.Label, $method.ReturnType
+    if (-not $method.Supported) { $methodHint.Text = 'One or more parameter types are not supported by this editor.' }
+    $row = 0
+    foreach ($parameter in @($method.Parameters)) {
+        $parameterPanel.RowCount++
+        [void]$parameterPanel.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 44))
+        $label = [Windows.Forms.Label]::new(); $label.Text = $parameter.Name + ' (' + ($parameter.Type -replace '^.*\.', '') + ')'
+        $label.Dock = 'Fill'; $label.AutoEllipsis = $true; $label.TextAlign = 'MiddleLeft'
+        if ($parameter.Kind -in @('Choice', 'EditableChoice')) {
+            $editor = [Windows.Forms.ComboBox]::new()
+            $editor.DropDownStyle = 'DropDownList'
+            if ($parameter.Kind -eq 'EditableChoice') { $editor.DropDownStyle = 'DropDown' }
+            foreach ($choice in @($parameter.Choices)) { [void]$editor.Items.Add([string]$choice) }
+            if ($parameter.Kind -eq 'Choice') { $editor.SelectedItem = [string]$parameter.Default } else { $editor.Text = [string]$parameter.Default }
+        } else {
+            $editor = [Windows.Forms.TextBox]::new(); $editor.Text = [string]$parameter.Default
+            if ($parameter.Type -eq 'System.String') { $editor.Multiline = $true; $editor.AcceptsReturn = $true; $editor.ScrollBars = 'Vertical' }
+        }
+        $editor.Dock = 'Fill'; $toolTip.SetToolTip($editor, [string]$parameter.Hint); $toolTip.SetToolTip($label, [string]$parameter.Hint)
+        $parameterPanel.Controls.Add($label, 0, $row); $parameterPanel.Controls.Add($editor, 1, $row)
+        $script:ParameterEditors += $editor; $row++
+    }
+    $runButton.Enabled = ($method.Supported -and $null -eq $script:Pending -and $null -ne $script:PatternData)
+}
+function Invoke-SelectedMethod {
+    $method = $methodCombo.SelectedItem
+    if ($null -eq $method -or $null -eq $script:ActionTarget -or $null -eq $script:PatternData -or $null -ne $script:Pending) { return }
+    $inputValues = @($script:ParameterEditors | ForEach-Object { [string]$_.Text })
+    $target = $script:ActionTarget
+    $request = @{
+        Op = 'Invoke'; TargetKind = $target.Kind; Ref = $target.Ref; PatternId = $target.PatternId
+        Token = $method.Token; Scope = $method.Scope; Arguments = $inputValues; SelectedRef = $script:Inspection.Summary.Ref
+    }
+    $actionDescription = $target.Ref + ' :: ' + $method.Label
+    $callback = {
+        param($data)
+        Add-Log ($actionDescription + [Environment]::NewLine + $data.Text)
+        Set-Status 'Method completed. Refresh to inspect changed state; see Objects for returned references.'
+    }.GetNewClosure()
+    [void](Send-EngineRequest $request $callback ('Running ' + $method.Name))
+}
+function Request-Objects {
+    [void](Send-EngineRequest @{ Op = 'Objects' } {
+        param($data)
+        $objectGrid.Rows.Clear()
+        foreach ($item in @($data.Items)) { [void]$objectGrid.Rows.Add([object[]]@([string]$item.Ref, [string]$item.Kind, [string]$item.Label)) }
+    } 'Reading object references')
+}
+function Open-SelectedObject {
+    if ($null -eq $objectGrid.CurrentRow -or $null -ne $script:Pending) { return }
+    $row = $objectGrid.CurrentRow; $ref = [string]$row.Cells[0].Value; $kind = [string]$row.Cells[1].Value
+    if ($kind -eq 'Element') {
+        [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $ref } { param($data) Show-PickedInspection $data; $tabs.SelectedTab = $propertyTab } 'Opening element')
+    } elseif ($kind -eq 'Range') {
+        if ($null -eq $script:Inspection) { Add-Log 'Select an element first.'; return }
+        $script:SuppressSelection = $true
+        [void]$patternCombo.Items.Add([pscustomobject]@{ Id = -1; Name = 'TextPatternRange ' + $ref; Ref = $ref })
+        $patternCombo.SelectedIndex = $patternCombo.Items.Count - 1
+        $script:SuppressSelection = $false
+        $tabs.SelectedTab = $patternTab; Request-SelectedPattern
+    }
+}
+
+$toolbar.Controls.Add((New-Button 'Pick in 3s' {
+    if ($null -eq $script:Pending) { $script:PickAt = [DateTime]::UtcNow.AddSeconds(3); Set-Status 'Move the pointer over the target. Picking in 3 seconds...' }
+}))
+$toolbar.Controls.Add((New-Button 'Refresh control' { Refresh-Inspection }))
+$toolbar.Controls.Add((New-Button 'Parent' {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Parent'; Ref = $script:Inspection.Summary.Ref; View = [string]$viewCombo.SelectedItem } { param($data) Show-PickedInspection $data } 'Getting parent')
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Refresh branch' {
+    if ($null -eq $script:Pending -and $null -ne $tree.SelectedNode -and $null -ne $tree.SelectedNode.Tag) {
+        $tree.SelectedNode.Tag.Loaded = $false; Load-TreeChildren $tree.SelectedNode
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Set focus' {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Focus'; Ref = $script:Inspection.Summary.Ref } { param($data) Add-Log $data.Text } 'Setting keyboard focus')
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Highlight' { Show-Outline }))
+$toolbar.Controls.Add((New-Button 'Copy properties' {
+    if ($null -ne $script:Inspection) {
+        $text = ($script:Inspection.Properties | ForEach-Object { $_.Name + "`t" + $_.Value }) -join [Environment]::NewLine
+        [Windows.Forms.Clipboard]::SetText($text); Set-Status 'Properties copied.'
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Reset worker' {
+    if ($script:Resetting) { return }; $script:Resetting = $true
+    try {
+        $script:PickAt = $null; $outline.Hide()
+        $script:Inspection = $null; $script:ActionTarget = $null; $script:PatternData = $null
+        $script:SuppressSelection = $true; $tree.Nodes.Clear(); $patternCombo.Items.Clear(); Clear-MethodEditor
+        $propertyGrid.Rows.Clear(); $objectGrid.Rows.Clear(); $script:SuppressSelection = $false
+        $selectionLabel.Text = 'Worker reset. Pick a control again.'
+        Add-Log 'Worker reset; references cleared. Any action already sent to a target may still complete. No action is retried.'
+        Start-Engine
+    } catch { Add-Log (Get-ErrorMessage $_) } finally { $script:Resetting = $false }
+}))
+$toolbar.Controls.Add((New-Button 'Open demo' {
+    $demoProc = Start-ThisScriptProcess ('-STA -File "{0}" -Demo' -f $script:ThisFile)
+    $demoProc.Dispose(); Add-Log 'Opened the disposable demo window. Pick its controls to try patterns.'
+}))
+$viewCombo = [Windows.Forms.ComboBox]::new(); $viewCombo.Width = 90; $viewCombo.DropDownStyle = 'DropDownList'
+$viewCombo.Items.AddRange([object[]]@('Control', 'Content', 'Raw')); $viewCombo.SelectedIndex = 0; $toolbar.Controls.Add($viewCombo)
+$toolTip.SetToolTip($viewCombo, 'Tree view. Changing this view reloads the Desktop tree.')
+$topCheck = [Windows.Forms.CheckBox]::new(); $topCheck.Text = 'Topmost'; $topCheck.AutoSize = $true
+$topCheck.Add_CheckedChanged({ $form.TopMost = $topCheck.Checked }); $toolbar.Controls.Add($topCheck)
+$highlightCheck = [Windows.Forms.CheckBox]::new(); $highlightCheck.Text = 'Outline on pick'; $highlightCheck.AutoSize = $true; $highlightCheck.Checked = $true
+$toolbar.Controls.Add($highlightCheck)
+
+$tree.Add_BeforeExpand({
+    param($sender, $eventArgs)
+    if ($script:SuppressSelection -or $null -eq $eventArgs.Node.Tag) { return }
+    if (-not $eventArgs.Node.Tag.Loaded) { $eventArgs.Cancel = $true; Load-TreeChildren $eventArgs.Node }
+})
+$tree.Add_AfterSelect({
+    param($sender, $eventArgs)
+    if ($script:SuppressSelection -or $null -eq $eventArgs.Node.Tag) { return }
+    if ($null -ne $script:Pending) { Set-Status 'Busy. Select the control again when the operation completes.'; return }
+    [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $eventArgs.Node.Tag.Ref } { param($data) Apply-Inspection $data } 'Inspecting control')
+})
+$patternCombo.Add_SelectedIndexChanged({ if (-not $script:SuppressSelection) { Request-SelectedPattern } })
+$methodCombo.Add_SelectedIndexChanged({ if (-not $script:SuppressSelection) { Build-ParameterEditor } })
+$objectGrid.Add_CellDoubleClick({ Open-SelectedObject })
+$viewCombo.Add_SelectedIndexChanged({
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation, then refresh the desired branch with this view.'; return }
+    Request-Root
+})
+$form.Add_PickHotKey({ Pick-Control })
+
+$timer = [Windows.Forms.Timer]::new(); $timer.Interval = 100
+$timer.Add_Tick({
+    try {
+        if ($outline.Visible -and [DateTime]::UtcNow -ge $script:OutlineUntil) { $outline.Hide() }
+        if ($null -ne $script:PickAt -and [DateTime]::UtcNow -ge $script:PickAt) { $script:PickAt = $null; Pick-Control }
+        if ($null -eq $script:Pending) { return }
+        if ($script:ReadTask.IsCompleted) {
+            $pending = $script:Pending; $script:Pending = $null
+            try {
+                $line = $script:ReadTask.GetAwaiter().GetResult(); $script:ReadTask = $null
+                if ($null -eq $line) {
+                    $details = ''
+                    if ($null -ne $script:ErrorTask -and $script:ErrorTask.IsCompleted) { $details = $script:ErrorTask.GetAwaiter().GetResult() }
+                    throw ('Worker exited. Use Reset worker. ' + $details)
+                }
+                $response = ConvertFrom-Json -InputObject $line
+                if (-not $response.Ok) { throw $response.Error }
+                Set-Status ($pending.Label + ' completed.')
+                & $pending.OnSuccess $response.Data
+            } catch {
+                Add-Log ($pending.Label + ' failed: ' + (Get-ErrorMessage $_)); Set-Status 'Operation failed; see log. A stale control must be selected again.'
+                if ($null -ne $pending.OnFailure) { & $pending.OnFailure }
+            }
+            Update-BusyControls
+        } else {
+            $elapsed = [int]([DateTime]::UtcNow - $script:Pending.Started).TotalSeconds
+            if ($elapsed -ge 10) { Set-Status ('{0}: waiting {1}s. Check the target for a dialog, or use Reset worker.' -f $script:Pending.Label, $elapsed) }
+        }
+    } catch { Add-Log (Get-ErrorMessage $_) }
+})
+$form.Add_Shown({
+    if ($form.RegisterPicker()) { Add-Log 'Ready to pick: hover a target control and press Ctrl+Shift+F8.' }
+    else { Add-Log 'Ctrl+Shift+F8 is already registered elsewhere. Use Pick in 3s.' }
+    try { Start-Engine } catch { Add-Log (Get-ErrorMessage $_); Set-Status 'Startup failed. See log.' }
+    $timer.Start()
+})
+$form.Add_FormClosing({ $timer.Stop(); $outline.Hide(); Stop-Engine })
+try { [Windows.Forms.Application]::Run($form) }
+finally { $timer.Dispose(); $outline.Dispose(); $toolTip.Dispose(); Stop-Engine; $form.Dispose() }
