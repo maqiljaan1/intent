@@ -1,0 +1,1735 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    DTORadar - a single-file Windows UI Automation inspector and pattern runner.
+.DESCRIPTION
+    Select a control with Ctrl+Shift+F8 (or Ctrl+Shift+8) while pointing at it, with the delayed
+    picker, or in the lazy-loaded desktop tree. Inspect its properties, choose
+    a supported pattern and method, supply typed parameters, and run it.
+
+    Everything ships in this .ps1. No modules, SDK, downloads, or installation
+    are required. Windows PowerShell 5.1 / .NET Framework is required. A small
+    embedded C# class provides only Win32 hotkeys and a non-activating outline.
+    The inspector UI, automation engine, method discovery, and parameter
+    conversion are PowerShell. UI Automation runs in a separate MTA PowerShell
+    process. The GUI stays responsive if an application provider blocks.
+
+    Pattern coverage is whatever the .NET Framework UIAutomationClient exposes
+    for the selected element: Invoke, Value, RangeValue, Toggle, ExpandCollapse,
+    Selection/SelectionItem, Scroll/ScrollItem, Window, Transform, Dock,
+    Grid/GridItem, Table/TableItem, MultipleView, Text, and other managed
+    patterns if available. Methods are discovered, not limited to that list.
+    This is NOT a full native Inspect.exe clone: MSAA/LegacyIAccessible,
+    native-only newer UIA pattern extensions, event tracing, and custom COM
+    patterns are not implemented. A provider can report a pattern and still
+    refuse an operation because of its current state or permissions.
+
+    QUICK START
+      powershell.exe -NoProfile -STA -File .\DTORadar.ps1
+      1. Hover a target control and press Ctrl+Shift+F8 (no click is sent).
+         Or press 'Pick in 3s' and move the pointer to a control.
+      2. Open the Patterns tab, choose a pattern and a method.
+      3. Fill in parameters and press Run method. Results appear in the log.
+      4. Refresh to observe changes. Refresh branch reloads tree children.
+
+    BROWSER PICKING (v1.1)
+      The picker now retries the provider hit and walks its Raw UIA subtree.
+      'Prefer controls' selects an interactive descendant rather than its
+      document or a button's text label. Choose 'Deepest' for the raw leaf.
+      The Hits tab lists overlapping candidates; double-click one to inspect.
+      Ctrl+Shift+F9 captures the keyboard-focused control without moving focus.
+      This is useful after Tab-ing into a web input. 'Focus in 3s' also works.
+      Browser accessibility must expose the child controls. If only Document
+      is exposed, deeper picking cannot invent DOM controls or hidden HTML
+      attributes. Check the browser's accessibility diagnostics, then retry.
+      No browser restart, browser flag, or security setting is changed.
+
+    SEARCH
+      Select a browser document or application window, then open Search.
+      Add property / operator / value filters and choose All (AND) or Any (OR).
+      Example: Name Contains Submit AND ControlType Equals Button.
+      Fields include Name, AutomationId, ClassName, ControlType, ProcessId,
+      ProcessName, FrameworkId, HelpText, state flags, SupportedPatterns,
+      RuntimeId, Depth, and properties known to the loaded managed UIA API.
+      Operators: Contains, Equals, NotEquals, StartsWith, EndsWith, Regex,
+      Exists, NotExists, GreaterThan, GreaterOrEqual, LessThan, LessOrEqual.
+      Exists means a property is exposed, even if its value is empty.
+      Numeric comparisons use invariant numbers. Text matching is insensitive
+      to case unless Match case is selected. Regex has a per-match timeout.
+      Scope: Selected subtree, Selected window, or Desktop. Raw is the default
+      search view. Double-click a result to inspect it and run its patterns.
+      Results include their matched property values and can be copied.
+      Searches do not scroll or realize virtualized controls. They can only
+      find elements exposed in the current accessibility tree, not every DOM node.
+      Node/time/depth/result limits are reported, along with inaccessible nodes.
+      Limits are checked BETWEEN provider calls; Reset worker recovers a hung call.
+
+    PARAMETER EXAMPLES
+      InvokePattern.Invoke()                         no parameters
+      ValuePattern.SetValue(value)                   text, including empty text
+      RangeValuePattern.SetValue(value)              decimal, e.g. 42.5
+      TogglePattern.Toggle()                         no parameters
+      ExpandCollapsePattern.Expand()                 no parameters
+      SelectionItemPattern.Select()                  no parameters
+      ScrollPattern.Scroll(horizontalAmount,
+                           verticalAmount)           enum dropdowns
+      ScrollPattern.SetScrollPercent(horizontalPercent,
+                                     verticalPercent) 0..100; -1 = unchanged
+      WindowPattern.SetWindowVisualState(state)       Normal/Minimized/Maximized
+      TransformPattern.Move(x, y)                     physical screen coordinates
+      GridPattern.GetItem(row, column)                zero-based indexes
+      SelectionPattern.Current.GetSelection()        selected element references
+      TablePattern.Current.GetRowHeaders()           row-header references
+      TextPattern.DocumentRange [get]                returns a saved text range
+      TextPatternRange.GetText(maxLength)             -1 for all text
+
+    OBJECT PARAMETERS AND RESULTS
+      Selected controls and returned UIA objects receive session references
+      such as @e12 (element) and @r13 (text range). Use these in element or range
+      parameter fields. References appear in the Objects tab. Double-click an
+      element to inspect it or a text range to explore its methods.
+      @selected resolves to the element selected WHEN RUN IS PRESSED.
+      @null passes a null reference only for element/range/object parameters.
+      A Point is x,y using decimal points. An AutomationTextAttribute accepts
+      a TextPattern field name such as FontNameAttribute or its numeric ID.
+      Object values use text (default), str:text, int:42, double:1.5, bool:true,
+      or an @reference. No parameter is executed as PowerShell code.
+
+    RECOVERY / LIMITS
+      Stale element: pick it again. Provider state can change at any time.
+      Busy provider: dismiss any modal target dialog or press Reset worker.
+      Reset loses session references. It does not undo a completed action,
+      and cannot guarantee cancellation of an action already sent to a target.
+      Tree loading is per branch, bounded by MaxChildren (default 300).
+      Numeric inputs use '.' as the decimal separator, without thousands commas.
+      Password text is not read automatically. Explicit actions are user driven.
+      Target must expose UI Automation. Canvas/game pixels are not controls.
+      For an elevated target, launch this tool at the same permitted integrity
+      level. Secure desktops are outside scope. Follow your organization's
+      PowerShell execution and application-control policy; the script does not
+      change it or request elevation. Constrained Language may block Add-Type.
+
+    VALIDATION
+      powershell.exe -NoProfile -MTA -File .\DTORadar.ps1 -SelfTest
+      Launches a disposable demo window, tests Invoke/Value/Toggle, property
+      search and deep picking, then closes it. No other application is modified.
+      powershell.exe -NoProfile -STA -File .\DTORadar.ps1 -Demo
+      Opens the same demo for interactive testing.
+
+    REFERENCES
+      https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.getsupportedpatterns
+      https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.frompoint
+      https://chromium.googlesource.com/chromium/src/+/main/docs/accessibility/browser/how_a11y_works_3.md
+      https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading
+      https://learn.microsoft.com/en-us/windows/win32/winauto/inspect-objects
+.PARAMETER MaxChildren
+    Maximum children loaded per tree branch. Raise for very large tables.
+.PARAMETER PickNodeLimit
+    Maximum nodes examined by a deep pick, default 5000.
+.PARAMETER SearchNodeLimit
+    Maximum nodes examined by one search, default 15000.
+.PARAMETER Demo
+    Open a harmless demo application for interactive inspection.
+.PARAMETER SelfTest
+    Run integration checks against the included demo. Requires -MTA.
+.NOTES
+    Version 1.1. Windows PowerShell 5.1. No external dependencies.
+#>
+[CmdletBinding()]
+param(
+    [ValidateRange(10, 10000)][int]$MaxChildren = 300,
+    [ValidateRange(100, 100000)][int]$PickNodeLimit = 5000,
+    [ValidateRange(100, 200000)][int]$SearchNodeLimit = 15000,
+    [switch]$Demo,
+    [switch]$SelfTest,
+    [switch]$Worker,
+    [int]$OwnerProcessId = 0
+)
+
+$ErrorActionPreference = 'Stop'
+if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop') {
+    throw 'Run this file on Windows using Windows PowerShell 5.1: powershell.exe -NoProfile -STA -File .\DTORadar.ps1'
+}
+$script:ThisFile = $PSCommandPath
+$script:PowerShellExe = Join-Path $PSHOME 'powershell.exe'
+$script:Invariant = [Globalization.CultureInfo]::InvariantCulture
+
+function Get-ErrorMessage($Failure) {
+    $ex = $Failure.Exception
+    if ($null -eq $ex) { return [string]$Failure }
+    while ($null -ne $ex.InnerException) { $ex = $ex.InnerException }
+    return ('{0}: {1}' -f $ex.GetType().Name, $ex.Message)
+}
+
+function Import-Automation {
+    Add-Type -AssemblyName @('UIAutomationClient', 'UIAutomationTypes', 'WindowsBase')
+}
+
+# All functions in this section are used only by the MTA automation process.
+function Initialize-AutomationEngine {
+    Import-Automation
+    $script:Objects = @{}
+    $script:ElementKeys = @{}
+    $script:NextObjectId = 0
+    $script:SelectedRef = ''
+    $script:TextAttributes = @{}
+    foreach ($field in [System.Windows.Automation.TextPattern].GetFields([Reflection.BindingFlags]'Public,Static')) {
+        if ($field.FieldType -eq [System.Windows.Automation.AutomationTextAttribute]) {
+            $script:TextAttributes[$field.Name] = $field.GetValue($null)
+        }
+    }
+    Initialize-SearchProperties
+}
+
+function Save-AutomationObject($Value) {
+    $key = $null
+    $prefix = 'o'
+    if ($Value -is [System.Windows.Automation.AutomationElement]) {
+        $prefix = 'e'
+        try { $key = ($Value.GetRuntimeId() -join '.') } catch { }
+        if ($key -and $script:ElementKeys.ContainsKey($key)) {
+            $ref = $script:ElementKeys[$key]
+            $script:Objects[$ref] = $Value
+            return $ref
+        }
+    } elseif ($Value -is [System.Windows.Automation.Text.TextPatternRange]) {
+        $prefix = 'r'
+    }
+    $script:NextObjectId++
+    $ref = '@{0}{1}' -f $prefix, $script:NextObjectId
+    $script:Objects[$ref] = $Value
+    if ($key) { $script:ElementKeys[$key] = $ref }
+    return $ref
+}
+
+function Resolve-AutomationObject([string]$Reference) {
+    if ($Reference -eq '@selected') { $Reference = $script:SelectedRef }
+    if ($Reference -eq '@null') { return $null }
+    if (-not $Reference -or -not $script:Objects.ContainsKey($Reference)) {
+        throw "Unknown reference '$Reference'. Pick the element again or use a reference from the Objects tab."
+    }
+    # A unary comma preserves arrays and other enumerable return values.
+    return ,$script:Objects[$Reference]
+}
+
+function Get-ElementSummary($Element) {
+    $ref = Save-AutomationObject $Element
+    try {
+        $c = $Element.Current
+        if ($null -eq $c -or $null -eq $c.ControlType) { throw 'Current element information is unavailable.' }
+        $name = [string]$c.Name
+        if ($name.Length -gt 120) { $name = $name.Substring(0, 120) + '...' }
+        $type = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+        return [pscustomobject]@{
+            Ref = $ref; Name = $name; ControlType = $type
+            AutomationId = $c.AutomationId; ProcessId = $c.ProcessId; ClassName = $c.ClassName
+            Label = ('{0}  {1}  [{2}]' -f $type, ($name -replace '[\r\n]+', ' '), $ref)
+        }
+    } catch {
+        return [pscustomobject]@{ Ref = $ref; Name = ''; ControlType = 'Unavailable'; AutomationId = ''; ProcessId = 0; ClassName = ''; Label = "$ref (element unavailable)" }
+    }
+}
+
+function Format-AutomationValue($Value, [int]$Depth = 0) {
+    if ($null -eq $Value) { return '<null>' }
+    if ([object]::ReferenceEquals($Value, [System.Windows.Automation.AutomationElement]::NotSupported)) { return '<not supported>' }
+    if ([object]::ReferenceEquals($Value, [System.Windows.Automation.TextPattern]::MixedAttributeValue)) { return '<mixed attribute>' }
+    if ($Value -is [System.Windows.Automation.AutomationElement]) { return (Get-ElementSummary $Value).Label }
+    if ($Value -is [System.Windows.Automation.Text.TextPatternRange]) { return ('{0} (TextPatternRange)' -f (Save-AutomationObject $Value)) }
+    if ($Value -is [System.Windows.Automation.AutomationIdentifier]) { return ('{0} ({1})' -f $Value.ProgrammaticName, $Value.Id) }
+    if ($Value -is [Array] -or $Value -is [System.Windows.Automation.AutomationElementCollection]) {
+        if ($Depth -ge 3) { return '<nested collection>' }
+        $items = @(); $count = 0
+        foreach ($item in $Value) {
+            if ($count -ge 300) { $items += '<remaining items omitted>'; break }
+            $items += Format-AutomationValue $item ($Depth + 1)
+            $count++
+        }
+        return '[' + ($items -join '; ') + ']'
+    }
+    if ($Value -is [IFormattable]) { return $Value.ToString($null, $script:Invariant) }
+    return [string]$Value
+}
+
+function Get-ParameterDescription([Reflection.ParameterInfo]$Parameter) {
+    $t = $Parameter.ParameterType
+    $kind = 'Text'; $choices = @(); $default = ''; $hint = ''; $supported = $true
+    if ($t.IsEnum) {
+        $kind = 'Choice'; $choices = @([Enum]::GetNames($t)); $default = $choices[0]
+        if ($choices -contains 'NoAmount') { $default = 'NoAmount' }
+    } elseif ($t -eq [bool]) {
+        $kind = 'Choice'; $choices = @('False', 'True'); $default = 'False'
+    } elseif ($t -eq [string]) {
+        $hint = 'Literal text; an empty field passes an empty string.'
+    } elseif ($t -eq [int] -or $t -eq [double] -or $t -eq [long]) {
+        $default = '0'; $hint = 'Number; decimal point is a dot.'
+        if ($Parameter.Name -eq 'maxLength') { $default = '-1'; $hint = '-1 = all text; otherwise a maximum character count.' }
+        if ($Parameter.Name -match 'Percent$') { $default = '-1'; $hint = '0 through 100; -1 leaves this axis unchanged.' }
+        if ($Parameter.Name -match '^(row|column)$') { $hint = 'Zero-based index.' }
+        if ($Parameter.Name -match 'milliseconds') { $default = '1000'; $hint = 'Timeout in milliseconds.' }
+    } elseif ($t -eq [System.Windows.Point]) {
+        $default = '0,0'; $hint = 'Physical screen coordinates: x,y (supports negative monitor coordinates).'
+    } elseif ($t -eq [System.Windows.Automation.AutomationElement]) {
+        $default = '@selected'; $hint = 'An @e reference from Objects, @selected, or @null.'
+    } elseif ($t -eq [System.Windows.Automation.Text.TextPatternRange]) {
+        $hint = 'An @r reference from Objects. Get DocumentRange or GetSelection first.'
+    } elseif ($t -eq [System.Windows.Automation.AutomationTextAttribute]) {
+        $kind = 'EditableChoice'; $choices = @($script:TextAttributes.Keys | Sort-Object)
+        $default = 'FontNameAttribute'; $hint = 'TextPattern attribute field name or numeric attribute ID.'
+    } elseif ($t -eq [object]) {
+        $hint = 'Literal string, str:text, int:42, double:1.5, bool:true, @reference, or @null.'
+    } else {
+        $supported = $false; $hint = 'This parameter type is not supported by the generic editor.'
+    }
+    return [pscustomobject]@{
+        Name = $Parameter.Name; Type = $t.FullName; Kind = $kind
+        Choices = $choices; Default = $default; Hint = $hint; Supported = $supported
+    }
+}
+
+function Get-CurrentProperty([type]$Type) {
+    # TablePattern hides GridPattern.Current with a different return type.
+    # Name-only GetProperty can throw AmbiguousMatchException in that case.
+    for ($level = $Type; $null -ne $level; $level = $level.BaseType) {
+        $property = $level.GetProperty('Current', [Reflection.BindingFlags]'Public,Instance,DeclaredOnly')
+        if ($null -ne $property) { return $property }
+    }
+    return $null
+}
+
+function Get-MethodDescriptions([type]$Type, [switch]$SkipCurrent) {
+    $items = @()
+    foreach ($method in $Type.GetMethods([Reflection.BindingFlags]'Public,Instance')) {
+        if ($method.DeclaringType.FullName -in @('System.Object', 'System.ValueType', 'System.Windows.Automation.BasePattern')) { continue }
+        if ($method.IsSpecialName -or $method.ContainsGenericParameters) { continue }
+        $parameters = @($method.GetParameters() | ForEach-Object { Get-ParameterDescription $_ })
+        $items += [pscustomobject]@{
+            Token = $method.MetadataToken; Name = $method.Name; Kind = 'Method'; Scope = 'Direct'
+            Label = '{0}({1})' -f $method.Name, (($parameters | ForEach-Object { $_.Name + ': ' + ($_.Type -replace '^.*\.', '') }) -join ', ')
+            ReturnType = $method.ReturnType.FullName; Parameters = $parameters
+            Supported = (@($parameters | Where-Object { -not $_.Supported }).Count -eq 0)
+        }
+    }
+    foreach ($prop in $Type.GetProperties([Reflection.BindingFlags]'Public,Instance')) {
+        if ($prop.Name -in @('Current', 'Cached') -or $prop.GetIndexParameters().Length -ne 0) { continue }
+        $getter = $prop.GetGetMethod()
+        if ($null -eq $getter) { continue }
+        $items += [pscustomobject]@{
+            Token = $getter.MetadataToken; Name = $prop.Name; Kind = 'Property'; Scope = 'Direct'
+            Label = $prop.Name + ' [get]'; ReturnType = $prop.PropertyType.FullName
+            Parameters = @(); Supported = $true
+        }
+    }
+    if (-not $SkipCurrent) {
+        $current = Get-CurrentProperty $Type
+        if ($null -ne $current) {
+            foreach ($method in @(Get-MethodDescriptions $current.PropertyType -SkipCurrent)) {
+                if ($method.Kind -ne 'Method') { continue }
+                $method.Scope = 'Current'; $method.Label = 'Current.' + $method.Label
+                $items += $method
+            }
+        }
+    }
+    return @($items | Sort-Object Label)
+}
+
+function Convert-MethodParameter([string]$Text, [type]$Type) {
+    if ($Type -eq [string]) { return [string]$Text }
+    $trimmed = $Text.Trim()
+    if ($Type.IsEnum) {
+        if (-not ([Enum]::GetNames($Type) -contains $trimmed)) { throw "Choose a named $($Type.Name) value." }
+        return [Enum]::Parse($Type, $trimmed, $true)
+    }
+    if ($Type -eq [bool]) { return [bool]::Parse($trimmed) }
+    if ($Type -eq [int]) { return [int]::Parse($trimmed, [Globalization.NumberStyles]::Integer, $script:Invariant) }
+    if ($Type -eq [long]) { return [long]::Parse($trimmed, [Globalization.NumberStyles]::Integer, $script:Invariant) }
+    if ($Type -eq [double]) {
+        $number = [double]::Parse($trimmed, [Globalization.NumberStyles]::Float, $script:Invariant)
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { throw 'Use a finite number.' }
+        return $number
+    }
+    if ($Type -eq [System.Windows.Point]) {
+        $xy = $trimmed.Split(',')
+        if ($xy.Length -ne 2) { throw 'A Point must be x,y using decimal points, for example -100,250.5.' }
+        return [System.Windows.Point]::new((Convert-MethodParameter $xy[0] ([double])), (Convert-MethodParameter $xy[1] ([double])))
+    }
+    if ($Type -eq [System.Windows.Automation.AutomationElement] -or $Type -eq [System.Windows.Automation.Text.TextPatternRange]) {
+        $value = Resolve-AutomationObject $trimmed
+        if ($null -ne $value -and -not $Type.IsInstanceOfType($value)) { throw "$trimmed is not a $($Type.Name)." }
+        return ,$value
+    }
+    if ($Type -eq [System.Windows.Automation.AutomationTextAttribute]) {
+        if ($script:TextAttributes.ContainsKey($trimmed)) { return $script:TextAttributes[$trimmed] }
+        $id = Convert-MethodParameter $trimmed ([int])
+        $attribute = [System.Windows.Automation.AutomationTextAttribute]::LookupById($id)
+        if ($null -eq $attribute) { throw "Unknown text attribute ID: $id" }
+        return $attribute
+    }
+    if ($Type -eq [object]) {
+        if ($trimmed.StartsWith('@')) { return ,(Resolve-AutomationObject $trimmed) }
+        if ($Text -match '^str:([\s\S]*)$') { return $Matches[1] }
+        if ($Text -match '^(int|double|bool):([\s\S]*)$') {
+            $typeName = $Matches[1]; $payload = $Matches[2]
+            $types = @{ int = [int]; double = [double]; bool = [bool] }
+            return Convert-MethodParameter $payload $types[$typeName]
+        }
+        return [string]$Text
+    }
+    throw "Unsupported parameter type: $($Type.FullName)"
+}
+
+function Get-AutomationWalker([string]$View) {
+    switch ($View) {
+        'Raw' { return [System.Windows.Automation.TreeWalker]::RawViewWalker }
+        'Content' { return [System.Windows.Automation.TreeWalker]::ContentViewWalker }
+        default { return [System.Windows.Automation.TreeWalker]::ControlViewWalker }
+    }
+}
+
+function Initialize-SearchProperties {
+    $script:SearchProperties = @{}
+    $assemblies = @([System.Windows.Automation.AutomationElement].Assembly, [System.Windows.Automation.AutomationProperty].Assembly) | Select-Object -Unique
+    foreach ($assembly in $assemblies) {
+        foreach ($type in $assembly.GetExportedTypes()) {
+            if ($type.Namespace -ne 'System.Windows.Automation') { continue }
+            foreach ($field in $type.GetFields([Reflection.BindingFlags]'Public,Static')) {
+                if ($field.FieldType -ne [System.Windows.Automation.AutomationProperty]) { continue }
+                $prop = $field.GetValue($null)
+                if ($null -eq $prop) { continue }
+                $name = $prop.ProgrammaticName -replace 'Identifiers\.', '.' -replace 'Property$', '' -replace '^AutomationElement\.', ''
+                $script:SearchProperties[$name] = $prop
+            }
+        }
+    }
+    $script:SearchFieldNames = @(@($script:SearchProperties.Keys) + @('ProcessName', 'SupportedPatterns', 'RuntimeId', 'Depth') | Sort-Object -Unique)
+}
+
+function Invoke-AutomationWalk($Root, $Walker, [int]$NodeLimit, [int]$Milliseconds, [int]$MaxDepth, [scriptblock]$Visit) {
+    # Iterative DFS avoids unbounded FindAll(Desktop, Descendants) and recursion.
+    # Provider calls themselves can still block; the separate worker is resettable.
+    $stack = [Collections.Generic.Stack[object]]::new()
+    $deferred = [Collections.Generic.Queue[object]]::new()
+    $stack.Push(@{ Element = $Root; Depth = 0 })
+    $seen = @{}; $scanned = 0; $errors = 0; $reason = ''; $depthLimited = $false
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($stack.Count -gt 0 -or $deferred.Count -gt 0) {
+        if ($scanned -ge $NodeLimit) { $reason = 'node limit'; break }
+        if ($watch.ElapsedMilliseconds -ge $Milliseconds) { $reason = 'time limit'; break }
+        if ($stack.Count -eq 0) { $stack.Push($deferred.Dequeue()) }
+        $frame = $stack.Pop(); $element = $frame.Element; $depth = [int]$frame.Depth
+        $scanned++
+        try {
+            $key = $element.GetRuntimeId() -join '.'
+            if ($key -and $seen.ContainsKey($key)) { $errors++; continue }
+            if ($key) { $seen[$key] = $true }
+        } catch { $errors++ }
+        if ($depth -gt 0) {
+            try {
+                $sibling = $Walker.GetNextSibling($element)
+                if ($null -ne $sibling) { $stack.Push(@{ Element = $sibling; Depth = $depth }) }
+            } catch { $errors++ }
+        }
+        $decision = & $Visit $element $depth
+        if ($decision.Error) { $errors++ }
+        if ($decision.Stop) { $reason = 'result limit'; break }
+        if ($decision.Descend -eq $false) { continue }
+        try {
+            $child = $Walker.GetFirstChild($element)
+            if ($null -ne $child) {
+                if ($depth -ge $MaxDepth) { $depthLimited = $true }
+                elseif ($decision.DeferChildren) { $deferred.Enqueue(@{ Element = $child; Depth = $depth + 1 }) }
+                else { $stack.Push(@{ Element = $child; Depth = $depth + 1 }) }
+            }
+        } catch { $errors++ }
+    }
+    $watch.Stop()
+    if (-not $reason -and $depthLimited) { $reason = 'depth limit' }
+    return [pscustomobject]@{
+        Scanned = $scanned; Errors = $errors; Milliseconds = $watch.ElapsedMilliseconds
+        Complete = (-not $reason -and $errors -eq 0); Limit = $reason; DepthLimited = $depthLimited
+    }
+}
+
+function Test-PointInRectangle($Rectangle, $Point) {
+    if ($null -eq $Rectangle -or $Rectangle.IsEmpty -or $Rectangle.Width -le 0 -or $Rectangle.Height -le 0) { return $false }
+    return ($Point.X -ge $Rectangle.X -and $Point.X -lt ($Rectangle.X + $Rectangle.Width) -and
+            $Point.Y -ge $Rectangle.Y -and $Point.Y -lt ($Rectangle.Y + $Rectangle.Height))
+}
+
+function Test-InteractiveControl($Current) {
+    $type = $Current.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+    if ($type -in @('Button', 'Edit', 'CheckBox', 'RadioButton', 'ComboBox', 'ListItem', 'MenuItem', 'TreeItem', 'Slider', 'Spinner', 'Hyperlink', 'TabItem', 'DataItem')) { return $true }
+    return ($Current.IsKeyboardFocusable -and $type -notin @('Document', 'Window', 'Pane', 'Group'))
+}
+
+function Get-DeepPick($Seed, $Point, [string]$Mode = 'Prefer controls') {
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $anchor = $Seed
+    # A provider may hit a text label inside a button or link. Start at the
+    # nearest interactive ancestor, without scanning unrelated background UI.
+    if ($Mode -ne 'Provider hit' -and -not (Test-InteractiveControl $Seed.Current)) {
+        $probe = $Seed
+        for ($i = 0; $i -lt 12; $i++) {
+            try {
+                $probe = $walker.GetParent($probe)
+                if ($null -eq $probe) { break }
+                $c = $probe.Current
+                if ($c.ControlType.ProgrammaticName -in @('ControlType.Document', 'ControlType.Window')) { break }
+                if ((Test-PointInRectangle $c.BoundingRectangle $Point) -and (Test-InteractiveControl $c)) { $anchor = $probe; break }
+            } catch { break }
+        }
+    }
+    $hits = [Collections.Generic.List[object]]::new()
+    $excludedProcessIds = @($OwnerProcessId, $PID)
+    $visitor = {
+        param($element, $depth)
+        try {
+            $c = $element.Current
+            if ($null -eq $c -or $null -eq $c.ControlType) { throw 'Current element information is unavailable.' }
+            if ($c.ProcessId -in $excludedProcessIds) { return @{ Descend = $false } }
+            $rect = $c.BoundingRectangle
+            $containsPoint = Test-PointInRectangle $rect $Point
+            if (-not $c.IsOffscreen -and $containsPoint) {
+                $summary = Get-ElementSummary $element
+                $hits.Add([pscustomobject]@{
+                    Element = $element; Summary = $summary; Depth = $depth
+                    Interactive = [bool](Test-InteractiveControl $c)
+                    Area = [double]$rect.Width * [double]$rect.Height
+                })
+            }
+            # Do not prune a grouping node solely because its bounds are empty
+            # or outside the point: web content can overflow its parent bounds.
+            return @{ Descend = ($Mode -ne 'Provider hit'); DeferChildren = (-not $rect.IsEmpty -and -not $containsPoint) }
+        } catch { return @{ Descend = $true; Error = $true } }
+    }.GetNewClosure()
+    $stats = Invoke-AutomationWalk $anchor $walker $PickNodeLimit 3000 96 $visitor
+    $sort = @(@{ Expression = { $_.Depth }; Descending = $true }, @{ Expression = { $_.Area }; Descending = $false })
+    if ($Mode -eq 'Prefer controls') { $sort = @(@{ Expression = { $_.Interactive }; Descending = $true }) + $sort }
+    $ranked = @($hits | Sort-Object -Property $sort)
+    $chosen = $Seed
+    if ($ranked.Count -gt 0) { $chosen = $ranked[0].Element }
+    $candidates = @($ranked | ForEach-Object {
+        [pscustomobject]@{ Ref = $_.Summary.Ref; Name = $_.Summary.Name; ControlType = $_.Summary.ControlType
+            AutomationId = $_.Summary.AutomationId; Depth = $_.Depth; Interactive = $_.Interactive }
+    })
+    return [pscustomobject]@{ Element = $chosen; Candidates = $candidates; Stats = $stats }
+}
+
+function Get-PointInspection($Point, [string]$Mode) {
+    $seed = [System.Windows.Automation.AutomationElement]::FromPoint($Point)
+    if ($null -eq $seed) { throw 'No accessible element at this screen point.' }
+    if ($seed.Current.ProcessId -in @($OwnerProcessId, $PID)) { throw 'Point at a control outside DTORadar.' }
+    if ($Mode -ne 'Provider hit') {
+        # Touch the raw tree, then retry once at the same physical coordinates.
+        # This permits a browser's asynchronous accessibility cache to catch up.
+        try { $null = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($seed) } catch { }
+        Start-Sleep -Milliseconds 150
+        try {
+            $retry = [System.Windows.Automation.AutomationElement]::FromPoint($Point)
+            if ($null -ne $retry -and $retry.Current.ProcessId -notin @($OwnerProcessId, $PID)) { $seed = $retry }
+        } catch { }
+    }
+    $result = Get-DeepPick $seed $Point $Mode
+    $inspection = Get-ElementInspection $result.Element
+    $notice = ''
+    if ($inspection.Summary.ControlType -eq 'Document') {
+        $notice = 'The browser document was selected. Check Hits or search its subtree. If no child controls are exposed, Tab to the target and use Ctrl+Shift+F9; see Help > BROWSER.'
+    }
+    $inspection | Add-Member -NotePropertyName PickInfo -NotePropertyValue ([pscustomobject]@{
+        Candidates = $result.Candidates; Stats = $result.Stats; Notice = $notice; Mode = $Mode
+    })
+    return $inspection
+}
+
+function Get-SearchField($Element, [string]$Field, [int]$Depth, $ProcessNames) {
+    try {
+        $value = $null
+        switch ($Field) {
+            'Depth' { $value = $Depth }
+            'RuntimeId' { $value = $Element.GetRuntimeId() -join ',' }
+            'SupportedPatterns' { $value = @($Element.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'Identifiers\.Pattern$', '' }) -join ', ' }
+            'ProcessName' {
+                $processId = $Element.Current.ProcessId
+                if (-not $ProcessNames.ContainsKey($processId)) {
+                    $process = [Diagnostics.Process]::GetProcessById($processId)
+                    try { $ProcessNames[$processId] = $process.ProcessName } finally { $process.Dispose() }
+                }
+                $value = $ProcessNames[$processId]
+            }
+            default {
+                if (-not $script:SearchProperties.ContainsKey($Field)) { throw "Unknown property: $Field" }
+                if ($Field -match '(^|\.)Value$' -and $Element.Current.IsPassword) {
+                    return @{ Known = $false; Exists = $false; Text = '<password value not read>'; Error = $false }
+                }
+                $value = $Element.GetCurrentPropertyValue($script:SearchProperties[$Field], $true)
+                if ([object]::ReferenceEquals($value, [System.Windows.Automation.AutomationElement]::NotSupported)) {
+                    return @{ Known = $true; Exists = $false; Text = ''; Value = $null; Error = $false }
+                }
+            }
+        }
+        $text = ''
+        if ($Field -eq 'ControlType') { $text = $value.ProgrammaticName -replace '^ControlType\.', '' }
+        elseif ($value -is [System.Windows.Automation.AutomationIdentifier]) { $text = $value.ProgrammaticName }
+        else { $text = Format-AutomationValue $value }
+        return @{ Known = $true; Exists = $true; Text = [string]$text; Value = $value; Error = $false }
+    } catch { return @{ Known = $false; Exists = $false; Text = ''; Value = $null; Error = $true } }
+}
+
+function Convert-SearchFilters($Filters, [bool]$MatchCase) {
+    $items = @()
+    $allowed = @('Contains', 'Equals', 'NotEquals', 'StartsWith', 'EndsWith', 'Regex', 'Exists', 'NotExists', 'GreaterThan', 'GreaterOrEqual', 'LessThan', 'LessOrEqual')
+    foreach ($filter in @($Filters)) {
+        $field = [string]$filter.Property; $operator = [string]$filter.Operator; $text = [string]$filter.Value
+        if ($script:SearchFieldNames -notcontains $field) { throw "Unknown search field: $field" }
+        if ($allowed -notcontains $operator) { throw "Unknown search operator: $operator" }
+        $regex = $null; $number = $null
+        if ($operator -eq 'Regex') {
+            $options = [Text.RegularExpressions.RegexOptions]::CultureInvariant
+            if (-not $MatchCase) { $options = $options -bor [Text.RegularExpressions.RegexOptions]::IgnoreCase }
+            $regex = [Text.RegularExpressions.Regex]::new($text, $options, [TimeSpan]::FromMilliseconds(100))
+        }
+        if ($operator -in @('GreaterThan', 'GreaterOrEqual', 'LessThan', 'LessOrEqual')) { $number = Convert-MethodParameter $text ([double]) }
+        $items += [pscustomobject]@{ Property = $field; Operator = $operator; Value = $text; Regex = $regex; Number = $number; MatchCase = $MatchCase }
+    }
+    if ($items.Count -eq 0) { throw 'Add at least one search filter.' }
+    return $items
+}
+
+function Test-SearchFilter($Field, $Filter) {
+    if (-not $Field.Known) { return $false }
+    if ($Filter.Operator -eq 'Exists') { return [bool]$Field.Exists }
+    if ($Filter.Operator -eq 'NotExists') { return (-not $Field.Exists) }
+    if (-not $Field.Exists) { return $false }
+    $comparison = [StringComparison]::OrdinalIgnoreCase
+    if ($Filter.MatchCase) { $comparison = [StringComparison]::Ordinal }
+    $text = [string]$Field.Text; $expected = [string]$Filter.Value
+    switch ($Filter.Operator) {
+        'Contains' { return ($text.IndexOf($expected, $comparison) -ge 0) }
+        'Equals' { return [string]::Equals($text, $expected, $comparison) }
+        'NotEquals' { return (-not [string]::Equals($text, $expected, $comparison)) }
+        'StartsWith' { return $text.StartsWith($expected, $comparison) }
+        'EndsWith' { return $text.EndsWith($expected, $comparison) }
+        'Regex' { return $Filter.Regex.IsMatch($text) }
+        default {
+            $number = 0.0
+            if (-not [double]::TryParse($text, [Globalization.NumberStyles]::Float, $script:Invariant, [ref]$number)) { return $false }
+            if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $false }
+            switch ($Filter.Operator) {
+                'GreaterThan' { return ($number -gt $Filter.Number) }
+                'GreaterOrEqual' { return ($number -ge $Filter.Number) }
+                'LessThan' { return ($number -lt $Filter.Number) }
+                'LessOrEqual' { return ($number -le $Filter.Number) }
+            }
+        }
+    }
+    return $false
+}
+
+function Get-SearchRoot([string]$Reference, [string]$Scope) {
+    if ($Scope -eq 'Desktop') { return [System.Windows.Automation.AutomationElement]::RootElement }
+    $root = Resolve-AutomationObject $Reference
+    if ($Scope -eq 'Selected subtree') { return $root }
+    if ($Scope -ne 'Selected window') { throw 'Choose Selected subtree, Selected window, or Desktop.' }
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $probe = $root; $seen = @{}
+    for ($i = 0; $i -lt 128; $i++) {
+        $key = $probe.GetRuntimeId() -join '.'
+        if ($seen.ContainsKey($key)) { throw 'Provider returned a cycle while finding the containing window.' }
+        $seen[$key] = $true
+        if ($probe.Current.ControlType.ProgrammaticName -eq 'ControlType.Window') { return $probe }
+        $parent = $walker.GetParent($probe)
+        if ($null -eq $parent) { return $probe }
+        if ([System.Windows.Automation.Automation]::Compare($parent, [System.Windows.Automation.AutomationElement]::RootElement)) { return $probe }
+        $probe = $parent
+    }
+    throw 'Containing-window lookup reached the ancestor limit.'
+}
+
+function Find-AutomationControls($Request) {
+    $filters = @(Convert-SearchFilters $Request.Filters ([bool]$Request.MatchCase))
+    $root = Get-SearchRoot ([string]$Request.Ref) ([string]$Request.Scope)
+    $walker = Get-AutomationWalker ([string]$Request.View)
+    $limit = [Math]::Min(2000, [Math]::Max(1, [int]$Request.MaxResults))
+    $milliseconds = [Math]::Min(120000, [Math]::Max(1000, [int]$Request.Seconds * 1000))
+    $results = [Collections.Generic.List[object]]::new(); $processNames = @{}
+    $state = @{ FieldErrors = 0 }
+    $excludedProcessIds = @($OwnerProcessId, $PID)
+    $visitor = {
+        param($element, $depth)
+        try {
+            $c = $element.Current
+            if ($null -eq $c -or $null -eq $c.ControlType) { throw 'Current element information is unavailable.' }
+            if ($c.ProcessId -in $excludedProcessIds) { return @{ Descend = $false } }
+        } catch { return @{ Descend = $true; Error = $true } }
+        if ($Request.VisibleOnly -and $c.IsOffscreen) { return @{ Descend = $true } }
+        $cache = @{}; $matched = 0; $values = @()
+        foreach ($filter in $filters) {
+            if (-not $cache.ContainsKey($filter.Property)) {
+                $cache[$filter.Property] = Get-SearchField $element $filter.Property $depth $processNames
+                if ($cache[$filter.Property].Error) { $state.FieldErrors++ }
+            }
+            $field = $cache[$filter.Property]
+            if (Test-SearchFilter $field $filter) { $matched++; $values += $filter.Property + '=' + $field.Text }
+        }
+        $isMatch = ($matched -eq $filters.Count)
+        if ($Request.Combine -eq 'Any') { $isMatch = ($matched -gt 0) }
+        if ($isMatch) {
+            $summary = Get-ElementSummary $element
+            $results.Add([pscustomobject]@{ Ref = $summary.Ref; Name = $summary.Name; ControlType = $summary.ControlType
+                AutomationId = $summary.AutomationId; ClassName = $summary.ClassName; ProcessId = $summary.ProcessId
+                Depth = $depth; Matched = ($values -join '; ') })
+        }
+        return @{ Descend = $true; Stop = ($results.Count -ge $limit) }
+    }.GetNewClosure()
+    $stats = Invoke-AutomationWalk $root $walker $SearchNodeLimit $milliseconds 128 $visitor
+    if ($state.FieldErrors -gt 0) { $stats.Complete = $false }
+    return [pscustomobject]@{ Items = @($results.ToArray()); Stats = $stats; FieldErrors = $state.FieldErrors
+        Root = Get-ElementSummary $root; Scope = $Request.Scope; View = $Request.View }
+}
+
+function Get-ElementInspection($Element) {
+    $summary = Get-ElementSummary $Element
+    if ($summary.ControlType -eq 'Unavailable') { throw 'The element is no longer available. Pick it again.' }
+    $script:SelectedRef = $summary.Ref
+    $properties = @(); $seen = @{}
+    $isPassword = [bool]$Element.Current.IsPassword
+    foreach ($prop in $Element.GetSupportedProperties()) {
+        if ($seen.ContainsKey($prop.Id)) { continue }; $seen[$prop.Id] = $true
+        try {
+            if ($isPassword -and $prop.ProgrammaticName -match '(ValuePattern.*ValueProperty|Text)') {
+                $formatted = '<password property not read>'
+            } else {
+                $formatted = Format-AutomationValue ($Element.GetCurrentPropertyValue($prop, $true))
+            }
+        } catch { $formatted = '<' + (Get-ErrorMessage $_) + '>' }
+        $properties += [pscustomobject]@{ Name = $prop.ProgrammaticName; Value = $formatted; Id = $prop.Id }
+    }
+    try { $runtimeId = $Element.GetRuntimeId() -join ',' } catch { $runtimeId = '<unavailable>' }
+    $properties += [pscustomobject]@{ Name = 'RuntimeId'; Value = $runtimeId; Id = 0 }
+    $patterns = @()
+    foreach ($pattern in $Element.GetSupportedPatterns()) {
+        $patterns += [pscustomobject]@{ Id = $pattern.Id; Name = $pattern.ProgrammaticName -replace 'Identifiers\.Pattern$', '' }
+    }
+    $rect = $Element.Current.BoundingRectangle
+    $bounds = $null
+    if (-not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+        $bounds = @{ X = $rect.X; Y = $rect.Y; Width = $rect.Width; Height = $rect.Height }
+    }
+    return [pscustomobject]@{
+        Summary = $summary; Properties = @($properties | Sort-Object Name)
+        Patterns = @($patterns | Sort-Object Name); Bounds = $bounds
+        IsPassword = $isPassword
+    }
+}
+
+function Get-TargetPattern([string]$ElementRef, [int]$PatternId) {
+    $element = Resolve-AutomationObject $ElementRef
+    $id = [System.Windows.Automation.AutomationPattern]::LookupById($PatternId)
+    if ($null -eq $id) { throw "This managed UIA version does not expose pattern ID $PatternId." }
+    return $element.GetCurrentPattern($id)
+}
+
+function Get-PatternInspection($Target) {
+    $properties = @()
+    $currentProp = Get-CurrentProperty ($Target.GetType())
+    if ($null -ne $currentProp) {
+        $current = $currentProp.GetValue($Target, $null)
+        foreach ($prop in $current.GetType().GetProperties()) {
+            try {
+                $formatted = Format-AutomationValue ($prop.GetValue($current, $null))
+            } catch { $formatted = '<' + (Get-ErrorMessage $_) + '>' }
+            $properties += [pscustomobject]@{ Name = $prop.Name; Value = $formatted }
+        }
+    }
+    return [pscustomobject]@{
+        Type = $Target.GetType().FullName
+        Methods = @(Get-MethodDescriptions ($Target.GetType()))
+        Properties = @($properties | Sort-Object Name)
+    }
+}
+
+function Invoke-EngineRequest($Request) {
+    switch ([string]$Request.Op) {
+        'Hello' { return @{ Ready = $true; Apartment = [Threading.Thread]::CurrentThread.ApartmentState.ToString(); SearchFields = $script:SearchFieldNames } }
+        'Root' {
+            return Get-ElementSummary ([System.Windows.Automation.AutomationElement]::RootElement)
+        }
+        'Children' {
+            $element = Resolve-AutomationObject $Request.Ref
+            $walker = Get-AutomationWalker $Request.View
+            $child = $walker.GetFirstChild($element)
+            $items = @(); $seen = @{}; $walked = 0
+            while ($null -ne $child -and $walked -lt $MaxChildren) {
+                $walked++
+                $summary = Get-ElementSummary $child
+                if ($seen.ContainsKey($summary.Ref)) { throw 'The provider returned a cycle while enumerating children.' }
+                $seen[$summary.Ref] = $true
+                if ($summary.ProcessId -ne $OwnerProcessId -and $summary.ProcessId -ne $PID) { $items += $summary }
+                $child = $walker.GetNextSibling($child)
+            }
+            return @{ Items = $items; Truncated = ($null -ne $child) }
+        }
+        'Pick' {
+            $point = [System.Windows.Point]::new([double]$Request.X, [double]$Request.Y)
+            return Get-PointInspection $point ([string]$Request.Mode)
+        }
+        'PickFocused' {
+            $element = [System.Windows.Automation.AutomationElement]::FocusedElement
+            if ($null -eq $element) { throw 'No control currently has keyboard focus.' }
+            if ($element.Current.ProcessId -in @($OwnerProcessId, $PID)) { throw 'Focus a target control outside DTORadar, then press Ctrl+Shift+F9.' }
+            return Get-ElementInspection $element
+        }
+        'Search' { return Find-AutomationControls $Request }
+        'Inspect' { return Get-ElementInspection (Resolve-AutomationObject $Request.Ref) }
+        'Parent' {
+            $walker = Get-AutomationWalker $Request.View
+            $parent = $walker.GetParent((Resolve-AutomationObject $Request.Ref))
+            if ($null -eq $parent) { throw 'This element has no parent in the selected tree view.' }
+            return Get-ElementInspection $parent
+        }
+        'Focus' {
+            (Resolve-AutomationObject $Request.Ref).SetFocus()
+            return @{ Text = 'SetFocus completed.' }
+        }
+        'Pattern' {
+            $element = Resolve-AutomationObject $Request.Ref
+            if ($element.Current.IsPassword -and [int]$Request.PatternId -eq [System.Windows.Automation.ValuePattern]::Pattern.Id) {
+                $target = Get-TargetPattern $Request.Ref $Request.PatternId
+                return @{ Type = $target.GetType().FullName; Methods = @(Get-MethodDescriptions ($target.GetType())); Properties = @(@{ Name = 'Value'; Value = '<password value not read>' }) }
+            }
+            return Get-PatternInspection (Get-TargetPattern $Request.Ref $Request.PatternId)
+        }
+        'Range' {
+            $range = Resolve-AutomationObject $Request.Ref
+            if ($range -isnot [System.Windows.Automation.Text.TextPatternRange]) { throw 'Choose a text range reference.' }
+            return Get-PatternInspection $range
+        }
+        'Invoke' {
+            # Bind the request's selection, not a later GUI selection.
+            $script:SelectedRef = [string]$Request.SelectedRef
+            if ($Request.TargetKind -eq 'Range') { $target = Resolve-AutomationObject $Request.Ref }
+            else { $target = Get-TargetPattern $Request.Ref $Request.PatternId }
+            $scope = [string]$Request.Scope
+            if (-not $scope) { $scope = 'Direct' }
+            $description = @(Get-MethodDescriptions ($target.GetType()) | Where-Object { $_.Token -eq [int]$Request.Token -and $_.Scope -eq $scope })
+            if ($description.Count -ne 1 -or -not $description[0].Supported) { throw 'Method is no longer available or its parameter types are unsupported.' }
+            $invokeTarget = $target
+            if ($scope -eq 'Current') {
+                $currentProperty = Get-CurrentProperty ($target.GetType())
+                $invokeTarget = $currentProperty.GetValue($target, $null)
+            }
+            $method = @($invokeTarget.GetType().GetMethods([Reflection.BindingFlags]'Public,Instance') | Where-Object { $_.MetadataToken -eq [int]$Request.Token })[0]
+            $parameterInfo = $method.GetParameters()
+            $inputArgs = @($Request.Arguments)
+            if ($inputArgs.Count -ne $parameterInfo.Length) { throw 'The parameter count does not match the method signature.' }
+            $converted = [object[]]::new($parameterInfo.Length)
+            for ($i = 0; $i -lt $parameterInfo.Length; $i++) {
+                try { $converted[$i] = Convert-MethodParameter ([string]$inputArgs[$i]) $parameterInfo[$i].ParameterType }
+                catch { throw ('Parameter {0}: {1}' -f $parameterInfo[$i].Name, (Get-ErrorMessage $_)) }
+            }
+            $result = $method.Invoke($invokeTarget, $converted)
+            $display = 'Completed (no return value).'
+            if ($method.ReturnType -ne [void]) { $display = Format-AutomationValue $result }
+            return @{ Text = $display; Method = $description[0].Label; ReturnType = $method.ReturnType.FullName }
+        }
+        'Objects' {
+            $items = @()
+            foreach ($ref in @($script:Objects.Keys | Sort-Object { [int]($_ -replace '\D', '') })) {
+                $obj = $script:Objects[$ref]
+                $kind = 'Object'; $label = $obj.GetType().Name
+                if ($obj -is [System.Windows.Automation.AutomationElement]) { $kind = 'Element'; $label = (Get-ElementSummary $obj).Label }
+                elseif ($obj -is [System.Windows.Automation.Text.TextPatternRange]) { $kind = 'Range'; $label = 'TextPatternRange' }
+                $items += @{ Ref = $ref; Kind = $kind; Label = $label }
+            }
+            return @{ Items = $items }
+        }
+        default { throw "Unknown engine operation: $($Request.Op)" }
+    }
+}
+
+if ($Worker) {
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'MTA') { throw 'Internal automation worker requires -MTA.' }
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    Initialize-AutomationEngine
+    while ($null -ne ($line = [Console]::ReadLine())) {
+        try {
+            $request = ConvertFrom-Json -InputObject $line
+            $data = Invoke-EngineRequest $request
+            $response = @{ Ok = $true; Data = $data }
+        } catch { $response = @{ Ok = $false; Error = Get-ErrorMessage $_ } }
+        $json = ConvertTo-Json -InputObject $response -Depth 16 -Compress
+        [Console]::WriteLine($json)
+        [Console]::Out.Flush()
+    }
+    return
+}
+
+function Start-ThisScriptProcess([string]$Arguments, [switch]$Redirect) {
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $script:PowerShellExe
+    $info.Arguments = '-NoProfile -NonInteractive ' + $Arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    if ($Redirect) {
+        $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    }
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $info
+    [void]$process.Start()
+    if ($Redirect) {
+        # Match the worker's Unicode input without a leading BOM.
+        $process.StandardInput.AutoFlush = $true
+    }
+    return $process
+}
+
+if ($SelfTest) {
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'MTA') { throw 'Use powershell.exe -NoProfile -MTA -File .\DTORadar.ps1 -SelfTest' }
+    Initialize-AutomationEngine
+    $demoProcess = Start-ThisScriptProcess ('-STA -File "{0}" -Demo' -f $script:ThisFile)
+    try {
+        $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$demoProcess.Id)
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $window = $null; $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ($null -eq $window -and [DateTime]::UtcNow -lt $deadline) {
+            if ($demoProcess.HasExited) { throw 'Demo process exited before the test could start.' }
+            $window = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $condition)
+            if ($null -eq $window) { Start-Sleep -Milliseconds 150 }
+        }
+        if ($null -eq $window) { throw 'Demo window did not appear within 20 seconds.' }
+        function Find-DemoControl([string]$Name) {
+            $filter = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+            $el = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $filter)
+            if ($null -eq $el) { throw "Demo control missing: $Name" }
+            return $el
+        }
+        function Invoke-DemoPattern($Element, $Pattern, [string]$MethodName, [object[]]$Values) {
+            $ref = Save-AutomationObject $Element
+            $target = Get-TargetPattern $ref $Pattern.Id
+            $method = @(Get-MethodDescriptions ($target.GetType()) | Where-Object { $_.Name -eq $MethodName })[0]
+            if ($null -eq $method) { throw "Method discovery failed: $MethodName" }
+            return Invoke-EngineRequest ([pscustomobject]@{ Op = 'Invoke'; Ref = $ref; PatternId = $Pattern.Id; Token = $method.Token; Scope = $method.Scope; TargetKind = 'Pattern'; SelectedRef = $ref; Arguments = $Values })
+        }
+        $edit = Find-DemoControl 'Demo text'
+        $testValue = "Test 'quotes', decimal 42.5, Unicode: $([char]0x00F1)$([char]0x6C34)"
+        $null = Invoke-DemoPattern $edit ([System.Windows.Automation.ValuePattern]::Pattern) 'SetValue' @($testValue)
+        if ($edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne $testValue) { throw 'Value.SetValue did not preserve text.' }
+        Write-Output 'PASS Value.SetValue: text and Unicode round trip.'
+        $null = Invoke-DemoPattern $edit ([System.Windows.Automation.ValuePattern]::Pattern) 'SetValue' @('')
+        if ($edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne '') { throw 'Empty-string parameter failed.' }
+        Write-Output 'PASS Value.SetValue: empty string.'
+        $check = Find-DemoControl 'Demo checkbox'
+        $before = $check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState
+        $null = Invoke-DemoPattern $check ([System.Windows.Automation.TogglePattern]::Pattern) 'Toggle' @()
+        if ($check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq $before) { throw 'Toggle did not change state.' }
+        Write-Output 'PASS Toggle.Toggle: checked state changed.'
+        $button = Find-DemoControl 'Increment demo counter'
+        $null = Invoke-DemoPattern $button ([System.Windows.Automation.InvokePattern]::Pattern) 'Invoke' @()
+        $counterChanged = $false; $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $counterChanged -and [DateTime]::UtcNow -lt $deadline) {
+            try { $null = Find-DemoControl 'Clicks: 1'; $counterChanged = $true }
+            catch { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $counterChanged) { throw 'Invoke did not update the demo counter within 5 seconds.' }
+        Write-Output 'PASS Invoke.Invoke: button handler changed the counter.'
+        $inspection = Get-ElementInspection $button
+        if (@($inspection.Patterns).Count -eq 0 -or @($inspection.Properties).Count -eq 0) { throw 'Inspection did not discover properties and patterns.' }
+        Write-Output 'PASS Discovery: selected element exposes properties and patterns.'
+        $windowRef = Save-AutomationObject $window
+        $search = Find-AutomationControls ([pscustomobject]@{
+            Ref = $windowRef; Scope = 'Selected subtree'; View = 'Raw'; Combine = 'All'; MatchCase = $false
+            VisibleOnly = $false; MaxResults = 20; Seconds = 5
+            Filters = @(@{ Property = 'Name'; Operator = 'Contains'; Value = 'demo counter' }, @{ Property = 'ControlType'; Operator = 'Equals'; Value = 'Button' })
+        })
+        if (@($search.Items).Count -ne 1 -or $search.Items[0].Name -ne 'Increment demo counter') { throw 'Property search failed to find exactly the demo button.' }
+        Write-Output 'PASS Search: AND filters find the button inside the demo subtree.'
+        $rect = $button.Current.BoundingRectangle
+        $point = [System.Windows.Point]::new($rect.X + $rect.Width / 2, $rect.Y + $rect.Height / 2)
+        $pick = Get-DeepPick $window $point 'Prefer controls'
+        if ($pick.Element.Current.Name -ne 'Increment demo counter') { throw 'Deep picking did not resolve the nested demo button.' }
+        Write-Output 'PASS Deep pick: raw-tree descent resolves the demo button.'
+        Write-Output 'All Windows integration checks passed.'
+    } finally {
+        if (-not $demoProcess.HasExited) { $demoProcess.Kill(); [void]$demoProcess.WaitForExit(3000) }
+        $demoProcess.Dispose()
+    }
+    return
+}
+
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    throw 'The GUI requires STA. Use: powershell.exe -NoProfile -STA -File .\DTORadar.ps1'
+}
+Add-Type -AssemblyName @('System.Windows.Forms', 'System.Drawing')
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+if ($Demo) {
+    $demoForm = [Windows.Forms.Form]::new()
+    $demoForm.Text = 'DTORadar Demo'; $demoForm.Size = [Drawing.Size]::new(620, 450)
+    $demoForm.StartPosition = 'CenterScreen'; $demoForm.Font = [Drawing.Font]::new('Segoe UI', 10)
+    $flow = [Windows.Forms.FlowLayoutPanel]::new(); $flow.Dock = 'Fill'; $flow.Padding = [Windows.Forms.Padding]::new(20)
+    $flow.FlowDirection = 'TopDown'; $flow.WrapContents = $false
+    $demoForm.Controls.Add($flow)
+    $intro = [Windows.Forms.Label]::new(); $intro.Text = 'Use DTORadar to change these disposable controls.'; $intro.AutoSize = $true
+    $flow.Controls.Add($intro)
+    $demoText = [Windows.Forms.TextBox]::new(); $demoText.Name = 'DemoText'; $demoText.AccessibleName = 'Demo text'; $demoText.Width = 480; $demoText.Text = 'Change me with Value.SetValue'
+    $flow.Controls.Add($demoText)
+    $demoCheck = [Windows.Forms.CheckBox]::new(); $demoCheck.Name = 'DemoCheck'; $demoCheck.AccessibleName = 'Demo checkbox'; $demoCheck.Text = 'Toggle me'; $demoCheck.AutoSize = $true
+    $flow.Controls.Add($demoCheck)
+    $demoButton = [Windows.Forms.Button]::new(); $demoButton.AccessibleName = 'Increment demo counter'; $demoButton.Text = 'Increment counter'; $demoButton.AutoSize = $true
+    $flow.Controls.Add($demoButton)
+    $script:DemoClicks = 0
+    $demoCounter = [Windows.Forms.Label]::new(); $demoCounter.Text = 'Clicks: 0'; $demoCounter.AutoSize = $true
+    $flow.Controls.Add($demoCounter)
+    $demoButton.Add_Click({ $script:DemoClicks++; $demoCounter.Text = 'Clicks: ' + $script:DemoClicks })
+    $demoCombo = [Windows.Forms.ComboBox]::new(); $demoCombo.AccessibleName = 'Demo choices'; $demoCombo.DropDownStyle = 'DropDownList'; $demoCombo.Width = 260
+    $demoCombo.Items.AddRange([object[]]@('Alpha', 'Beta', 'Gamma')); $demoCombo.SelectedIndex = 0
+    $flow.Controls.Add($demoCombo)
+    $demoSlider = [Windows.Forms.TrackBar]::new(); $demoSlider.AccessibleName = 'Demo slider'; $demoSlider.Maximum = 100; $demoSlider.Value = 25; $demoSlider.Width = 480
+    $flow.Controls.Add($demoSlider)
+    [Windows.Forms.Application]::Run($demoForm)
+    $demoForm.Dispose()
+    return
+}
+
+# Only native window plumbing is compiled; no automation logic is hidden here.
+if (-not ('DTORadar.NativeForm' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace DTORadar {
+    public class NativeForm : Form {
+        [DllImport("user32.dll", SetLastError=true)] static extern bool RegisterHotKey(IntPtr h, int id, uint modifiers, uint key);
+        [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+        [DllImport("user32.dll")] static extern bool GetPhysicalCursorPos(out POINT point);
+        [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
+        public event EventHandler PickHotKey;
+        public event EventHandler FocusHotKey;
+        public int RegisterPicker() {
+            int registered = 0;
+            if (RegisterHotKey(Handle, 1, 0x4006, 0x77)) registered |= 1;
+            if (RegisterHotKey(Handle, 2, 0x4006, 0x38)) registered |= 2;
+            if (RegisterHotKey(Handle, 3, 0x4006, 0x78)) registered |= 4;
+            return registered;
+        }
+        public static void EnableDpi() { SetProcessDPIAware(); }
+        public static Point CursorPoint() { POINT p; if (!GetPhysicalCursorPos(out p) && !GetCursorPos(out p)) throw new InvalidOperationException("Cannot read cursor position."); return new Point(p.X, p.Y); }
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x0312) {
+                int id = m.WParam.ToInt32();
+                if ((id == 1 || id == 2) && PickHotKey != null) PickHotKey(this, EventArgs.Empty);
+                if (id == 3 && FocusHotKey != null) FocusHotKey(this, EventArgs.Empty);
+            }
+            base.WndProc(ref m);
+        }
+        protected override void OnHandleDestroyed(EventArgs e) { for (int i=1; i<=3; i++) UnregisterHotKey(Handle, i); base.OnHandleDestroyed(e); }
+    }
+    public class OutlineForm : Form {
+        public OutlineForm() {
+            FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
+            TopMost = true; BackColor = Color.Magenta; TransparencyKey = Color.Magenta;
+            StartPosition = FormStartPosition.Manual;
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x080800A0; return p; } }
+        protected override void OnPaint(PaintEventArgs e) { using (var pen = new Pen(Color.OrangeRed, 4)) e.Graphics.DrawRectangle(pen, 2, 2, Math.Max(0, Width-5), Math.Max(0, Height-5)); }
+    }
+}
+'@
+}
+[DTORadar.NativeForm]::EnableDpi()
+
+$script:Engine = $null; $script:Pending = $null; $script:ReadTask = $null
+$script:ErrorTask = $null; $script:InputWriter = $null
+$script:Inspection = $null; $script:ActionTarget = $null; $script:PatternData = $null
+$script:ParameterEditors = @(); $script:SuppressSelection = $false
+$script:PickAt = $null; $script:PickFocusedNext = $false; $script:OutlineUntil = [DateTime]::MinValue
+$script:WorkerReady = $false; $script:Resetting = $false
+
+function New-Button([string]$Text, [scriptblock]$Click) {
+    $button = [Windows.Forms.Button]::new(); $button.Text = $Text; $button.AutoSize = $true
+    $button.Height = 30; $button.Margin = [Windows.Forms.Padding]::new(3)
+    if ($null -ne $Click) { $button.Add_Click($Click) }
+    return $button
+}
+function New-Grid {
+    $grid = [Windows.Forms.DataGridView]::new(); $grid.Dock = 'Fill'
+    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false
+    $grid.RowHeadersVisible = $false; $grid.AutoSizeColumnsMode = 'Fill'
+    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
+    $grid.BackgroundColor = [Drawing.Color]::White; $grid.BorderStyle = 'None'
+    return $grid
+}
+function Add-Log([string]$Text) {
+    if ($logBox.TextLength -gt 150000) { $logBox.Text = $logBox.Text.Substring($logBox.TextLength - 100000) }
+    $logBox.AppendText(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Text) + [Environment]::NewLine)
+    $logBox.SelectionStart = $logBox.TextLength; $logBox.ScrollToCaret()
+}
+function Set-Status([string]$Text) { $statusLabel.Text = $Text }
+
+$form = [DTORadar.NativeForm]::new()
+$form.Text = 'DTORadar - UI Automation Inspector'
+$form.Size = [Drawing.Size]::new(1220, 860); $form.MinimumSize = [Drawing.Size]::new(920, 680)
+$form.StartPosition = 'CenterScreen'; $form.Font = [Drawing.Font]::new('Segoe UI', 9)
+$form.AutoScaleMode = 'Dpi'
+$outline = [DTORadar.OutlineForm]::new()
+
+$layout = [Windows.Forms.TableLayoutPanel]::new(); $layout.Dock = 'Fill'; $layout.ColumnCount = 1; $layout.RowCount = 5
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 42))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 140))
+[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 28))
+$form.Controls.Add($layout)
+$toolbar = [Windows.Forms.FlowLayoutPanel]::new(); $toolbar.Dock = 'Fill'; $toolbar.AutoSize = $true; $toolbar.Padding = [Windows.Forms.Padding]::new(4)
+$layout.Controls.Add($toolbar, 0, 0)
+$selectionLabel = [Windows.Forms.Label]::new(); $selectionLabel.Dock = 'Fill'; $selectionLabel.Padding = [Windows.Forms.Padding]::new(10, 7, 5, 0)
+$selectionLabel.Text = 'Pick a control with Ctrl+Shift+F8, or expand Desktop to browse controls.'; $selectionLabel.AutoEllipsis = $true
+$layout.Controls.Add($selectionLabel, 0, 1)
+$split = [Windows.Forms.SplitContainer]::new(); $split.Dock = 'Fill'; $split.Size = [Drawing.Size]::new(1100, 500)
+$split.SplitterDistance = 360; $split.Panel1MinSize = 220; $split.Panel2MinSize = 380
+$layout.Controls.Add($split, 0, 2)
+$tree = [Windows.Forms.TreeView]::new(); $tree.Dock = 'Fill'; $tree.HideSelection = $false; $tree.ShowNodeToolTips = $true
+$split.Panel1.Controls.Add($tree)
+$tabs = [Windows.Forms.TabControl]::new(); $tabs.Dock = 'Fill'; $split.Panel2.Controls.Add($tabs)
+$propertyTab = [Windows.Forms.TabPage]::new('Properties'); $patternTab = [Windows.Forms.TabPage]::new('Patterns')
+$objectsTab = [Windows.Forms.TabPage]::new('Objects'); $helpTab = [Windows.Forms.TabPage]::new('Help')
+$hitsTab = [Windows.Forms.TabPage]::new('Hits'); $searchTab = [Windows.Forms.TabPage]::new('Search')
+$tabs.TabPages.AddRange([Windows.Forms.TabPage[]]@($propertyTab, $patternTab, $hitsTab, $searchTab, $objectsTab, $helpTab))
+$propertyGrid = New-Grid
+[void]$propertyGrid.Columns.Add('Property', 'Property'); [void]$propertyGrid.Columns.Add('Value', 'Value')
+$propertyGrid.Columns[0].FillWeight = 44; $propertyGrid.Columns[1].FillWeight = 56
+$propertyTab.Controls.Add($propertyGrid)
+$logBox = [Windows.Forms.TextBox]::new(); $logBox.Dock = 'Fill'; $logBox.Multiline = $true; $logBox.ReadOnly = $true
+$logBox.ScrollBars = 'Both'; $logBox.WordWrap = $false; $logBox.Font = [Drawing.Font]::new('Consolas', 9)
+$layout.Controls.Add($logBox, 0, 3)
+$statusLabel = [Windows.Forms.Label]::new(); $statusLabel.Dock = 'Fill'; $statusLabel.Padding = [Windows.Forms.Padding]::new(8, 5, 0, 0); $statusLabel.AutoEllipsis = $true
+$layout.Controls.Add($statusLabel, 0, 4)
+
+$patternLayout = [Windows.Forms.TableLayoutPanel]::new(); $patternLayout.Dock = 'Fill'; $patternLayout.RowCount = 6; $patternLayout.ColumnCount = 1
+foreach ($height in @(34, 34, 50)) { [void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, $height)) }
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 60))
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 38))
+[void]$patternLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 40))
+$patternTab.Controls.Add($patternLayout)
+$patternCombo = [Windows.Forms.ComboBox]::new(); $patternCombo.Dock = 'Fill'; $patternCombo.DropDownStyle = 'DropDownList'; $patternCombo.DisplayMember = 'Name'
+$patternLayout.Controls.Add($patternCombo, 0, 0)
+$methodCombo = [Windows.Forms.ComboBox]::new(); $methodCombo.Dock = 'Fill'; $methodCombo.DropDownStyle = 'DropDownList'; $methodCombo.DisplayMember = 'Label'
+$patternLayout.Controls.Add($methodCombo, 0, 1)
+$methodHint = [Windows.Forms.Label]::new(); $methodHint.Dock = 'Fill'; $methodHint.Text = 'Choose a supported pattern, then a method.'
+$patternLayout.Controls.Add($methodHint, 0, 2)
+$parameterPanel = [Windows.Forms.TableLayoutPanel]::new(); $parameterPanel.Dock = 'Fill'; $parameterPanel.AutoScroll = $true
+$parameterPanel.ColumnCount = 2; $parameterPanel.RowCount = 0
+[void]$parameterPanel.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent, 34))
+[void]$parameterPanel.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent, 66))
+$patternLayout.Controls.Add($parameterPanel, 0, 3)
+$runRow = [Windows.Forms.FlowLayoutPanel]::new(); $runRow.Dock = 'Fill'
+$runButton = New-Button 'Run method' { Invoke-SelectedMethod }; $runButton.Enabled = $false
+$runRow.Controls.Add($runButton)
+$runRow.Controls.Add((New-Button 'Refresh pattern' { Request-SelectedPattern }))
+$patternLayout.Controls.Add($runRow, 0, 4)
+$patternPropertyGrid = New-Grid
+[void]$patternPropertyGrid.Columns.Add('Property', 'Pattern property'); [void]$patternPropertyGrid.Columns.Add('Value', 'Current value')
+$patternLayout.Controls.Add($patternPropertyGrid, 0, 5)
+$toolTip = [Windows.Forms.ToolTip]::new(); $toolTip.AutoPopDelay = 15000
+
+$hitsLayout = [Windows.Forms.TableLayoutPanel]::new(); $hitsLayout.Dock = 'Fill'; $hitsLayout.ColumnCount = 1; $hitsLayout.RowCount = 3
+[void]$hitsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 65))
+[void]$hitsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 38))
+[void]$hitsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+$hitsTab.Controls.Add($hitsLayout)
+$hitsLabel = [Windows.Forms.Label]::new(); $hitsLabel.Dock = 'Fill'; $hitsLabel.Text = 'Pick a control to list elements under that screen point. Double-click a candidate to inspect it.'
+$hitsLayout.Controls.Add($hitsLabel, 0, 0)
+$hitsButtons = [Windows.Forms.FlowLayoutPanel]::new(); $hitsButtons.Dock = 'Fill'
+$hitsButtons.Controls.Add((New-Button 'Inspect candidate' { Open-ResultElement $hitsGrid }))
+$hitsButtons.Controls.Add((New-Button 'Copy reference' { Copy-ResultReference $hitsGrid }))
+$hitsLayout.Controls.Add($hitsButtons, 0, 1)
+$hitsGrid = New-Grid
+foreach ($column in @('Reference', 'Name', 'ControlType', 'AutomationId', 'Depth', 'Interactive')) { [void]$hitsGrid.Columns.Add($column, $column) }
+$hitsGrid.Columns[0].FillWeight = 12; $hitsGrid.Columns[1].FillWeight = 32; $hitsGrid.Columns[2].FillWeight = 18
+$hitsGrid.Columns[3].FillWeight = 20; $hitsGrid.Columns[4].FillWeight = 8; $hitsGrid.Columns[5].FillWeight = 10
+$hitsLayout.Controls.Add($hitsGrid, 0, 2)
+
+$searchLayout = [Windows.Forms.TableLayoutPanel]::new(); $searchLayout.Dock = 'Fill'; $searchLayout.ColumnCount = 1; $searchLayout.RowCount = 5
+[void]$searchLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize))
+[void]$searchLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 120))
+[void]$searchLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize))
+[void]$searchLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 58))
+[void]$searchLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+$searchTab.Controls.Add($searchLayout)
+$searchOptions = [Windows.Forms.FlowLayoutPanel]::new(); $searchOptions.Dock = 'Fill'; $searchOptions.AutoSize = $true
+$searchScope = [Windows.Forms.ComboBox]::new(); $searchScope.DropDownStyle = 'DropDownList'; $searchScope.Width = 148
+$searchScope.Items.AddRange([object[]]@('Selected subtree', 'Selected window', 'Desktop')); $searchScope.SelectedIndex = 0
+$searchOptions.Controls.Add($searchScope); $toolTip.SetToolTip($searchScope, 'Scope is captured when Search is pressed. Select a document/window first.')
+$searchView = [Windows.Forms.ComboBox]::new(); $searchView.DropDownStyle = 'DropDownList'; $searchView.Width = 85
+$searchView.Items.AddRange([object[]]@('Raw', 'Control', 'Content')); $searchView.SelectedIndex = 0
+$searchOptions.Controls.Add($searchView)
+$searchCombine = [Windows.Forms.ComboBox]::new(); $searchCombine.DropDownStyle = 'DropDownList'; $searchCombine.Width = 105
+$searchCombine.Items.AddRange([object[]]@('All (AND)', 'Any (OR)')); $searchCombine.SelectedIndex = 0; $searchOptions.Controls.Add($searchCombine)
+$searchCase = [Windows.Forms.CheckBox]::new(); $searchCase.Text = 'Match case'; $searchCase.AutoSize = $true; $searchOptions.Controls.Add($searchCase)
+$searchVisible = [Windows.Forms.CheckBox]::new(); $searchVisible.Text = 'Visible only'; $searchVisible.AutoSize = $true; $searchOptions.Controls.Add($searchVisible)
+$searchLayout.Controls.Add($searchOptions, 0, 0)
+$filterGrid = New-Grid; $filterGrid.ReadOnly = $false
+$filterPropertyColumn = [Windows.Forms.DataGridViewComboBoxColumn]::new(); $filterPropertyColumn.Name = 'Property'; $filterPropertyColumn.HeaderText = 'Property / attribute'; $filterPropertyColumn.FillWeight = 35
+$filterOperatorColumn = [Windows.Forms.DataGridViewComboBoxColumn]::new(); $filterOperatorColumn.Name = 'Operator'; $filterOperatorColumn.HeaderText = 'Operator'; $filterOperatorColumn.FillWeight = 25
+$filterOperatorColumn.Items.AddRange([object[]]@('Contains', 'Equals', 'NotEquals', 'StartsWith', 'EndsWith', 'Regex', 'Exists', 'NotExists', 'GreaterThan', 'GreaterOrEqual', 'LessThan', 'LessOrEqual'))
+$filterValueColumn = [Windows.Forms.DataGridViewTextBoxColumn]::new(); $filterValueColumn.Name = 'Value'; $filterValueColumn.HeaderText = 'Value'; $filterValueColumn.FillWeight = 40
+[void]$filterGrid.Columns.Add($filterPropertyColumn); [void]$filterGrid.Columns.Add($filterOperatorColumn); [void]$filterGrid.Columns.Add($filterValueColumn)
+$filterGrid.EditMode = 'EditOnEnter'
+$searchLayout.Controls.Add($filterGrid, 0, 1)
+$searchButtons = [Windows.Forms.FlowLayoutPanel]::new(); $searchButtons.Dock = 'Fill'; $searchButtons.AutoSize = $true
+$searchButtons.Controls.Add((New-Button 'Add filter' { if ($script:WorkerReady) { [void]$filterGrid.Rows.Add([object[]]@('Name', 'Contains', '')) } }))
+$searchButtons.Controls.Add((New-Button 'Remove filter' { if ($null -ne $filterGrid.CurrentRow) { $filterGrid.Rows.RemoveAt($filterGrid.CurrentRow.Index) } }))
+$searchButton = New-Button 'Search' { Request-ControlSearch }; $searchButton.Enabled = $false; $searchButtons.Controls.Add($searchButton)
+$searchButtons.Controls.Add((New-Button 'Inspect result' { Open-ResultElement $searchGrid }))
+$searchButtons.Controls.Add((New-Button 'Copy results' { Copy-SearchResults }))
+foreach ($name in @('Max results', 'Seconds')) {
+    $label = [Windows.Forms.Label]::new(); $label.Text = $name; $label.AutoSize = $true; $label.Padding = [Windows.Forms.Padding]::new(0, 6, 0, 0)
+    $searchButtons.Controls.Add($label)
+    $number = [Windows.Forms.NumericUpDown]::new(); $number.Width = 62; $number.Minimum = 1
+    if ($name -eq 'Max results') { $number.Maximum = 2000; $number.Value = 200; $searchMax = $number }
+    else { $number.Maximum = 120; $number.Value = 10; $searchSeconds = $number }
+    $searchButtons.Controls.Add($number)
+}
+$searchLayout.Controls.Add($searchButtons, 0, 2)
+$searchSummary = [Windows.Forms.Label]::new(); $searchSummary.Dock = 'Fill'; $searchSummary.Text = 'Example: Name Contains Submit AND ControlType Equals Button. Blank Contains matches all exposed values. Double-click a result to inspect it.'
+$searchLayout.Controls.Add($searchSummary, 0, 3)
+$searchGrid = New-Grid; $searchGrid.AutoSizeColumnsMode = 'None'
+$searchColumns = [ordered]@{ Reference = 75; Name = 180; ControlType = 100; AutomationId = 150; ClassName = 150; ProcessId = 75; Matched = 250 }
+foreach ($name in $searchColumns.Keys) { [void]$searchGrid.Columns.Add($name, $name); $searchGrid.Columns[$name].Width = $searchColumns[$name] }
+$searchLayout.Controls.Add($searchGrid, 0, 4)
+
+$objectsLayout = [Windows.Forms.TableLayoutPanel]::new(); $objectsLayout.Dock = 'Fill'; $objectsLayout.RowCount = 2; $objectsLayout.ColumnCount = 1
+[void]$objectsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 40))
+[void]$objectsLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent, 100))
+$objectsTab.Controls.Add($objectsLayout)
+$objectButtons = [Windows.Forms.FlowLayoutPanel]::new(); $objectButtons.Dock = 'Fill'
+$objectButtons.Controls.Add((New-Button 'Refresh objects' { Request-Objects }))
+$objectButtons.Controls.Add((New-Button 'Open selected object' { Open-SelectedObject }))
+$objectButtons.Controls.Add((New-Button 'Copy reference' {
+    if ($null -ne $objectGrid.CurrentRow) { [Windows.Forms.Clipboard]::SetText([string]$objectGrid.CurrentRow.Cells[0].Value) }
+}))
+$objectsLayout.Controls.Add($objectButtons, 0, 0)
+$objectGrid = New-Grid
+[void]$objectGrid.Columns.Add('Reference', 'Reference'); [void]$objectGrid.Columns.Add('Kind', 'Kind'); [void]$objectGrid.Columns.Add('Description', 'Description')
+$objectGrid.Columns[0].FillWeight = 16; $objectGrid.Columns[1].FillWeight = 16; $objectGrid.Columns[2].FillWeight = 68
+$objectsLayout.Controls.Add($objectGrid, 0, 1)
+$helpBox = [Windows.Forms.TextBox]::new(); $helpBox.Dock = 'Fill'; $helpBox.Multiline = $true; $helpBox.ReadOnly = $true; $helpBox.ScrollBars = 'Vertical'
+$helpBox.Font = [Drawing.Font]::new('Consolas', 10)
+$helpBox.Text = @'
+SELECT
+Hover a target and press Ctrl+Shift+F8 (or Ctrl+Shift+8).
+Both shortcuts pick without clicking. The digit 8 is an alias.
+Or click Pick in 3s and move the pointer to the target.
+Expand Desktop / a control to load its immediate children.
+Picked controls appear as separate roots for quick exploration.
+Use Parent to walk upward; choose Raw for non-control nodes.
+
+BROWSER
+Default 'Prefer controls' scans raw descendants and prefers
+interactive controls over document containers and text labels.
+'Deepest' chooses a raw leaf; 'Provider hit' skips the deep scan.
+Hits lists candidates from the last point. Double-click one.
+Overlapping rectangles do not establish visual stacking order.
+The picker stays within the provider's hit subtree or a nearby
+interactive parent, so it does not search windows behind it.
+Ctrl+Shift+F9 picks the keyboard-focused element. First Tab to
+the desired browser input, then use that shortcut. Alternatively
+click Focus in 3s and focus the target before the timer expires.
+If only Document is still exposed, check browser accessibility
+diagnostics (for example chrome://accessibility in Chrome).
+Accessibility trees depend on the page and browser provider.
+DTORadar cannot discover DOM controls/attributes absent from UIA.
+It does not change browser flags, restart browsers, or open a
+remote-debugging port. An iframe may use a different process ID;
+deep picking/search do not exclude it for that reason.
+
+SEARCH
+Select a document/container/window, then choose the Search tab.
+Scope: Selected subtree (includes root), Selected window, Desktop.
+Raw view includes grouping nodes. Add filters; use All/Any.
+Examples: Name Contains Submit; ControlType Equals Button;
+AutomationId Equals login; ClassName Contains Edit;
+IsEnabled Equals True; ProcessName Equals msedge;
+SupportedPatterns Contains Invoke; Depth GreaterThan 2.
+Pattern properties are also listed, such as ValuePattern.Value.
+Exists means exposed, including an empty value. NotExists is
+true only when the provider reports the property unsupported.
+Errors and protected password values never count as missing.
+Regex has a 100 ms per-match timeout. Numeric comparisons use
+a dot for decimals. Inputs are not executed as PowerShell code.
+Double-click a result to inspect it and use the Patterns tab.
+Copy results produces tab-separated text for pasting.
+The summary reports the captured root, limits, and read errors.
+Node cap defaults to 15000; raise -SearchNodeLimit if needed.
+Time caps are checked between provider calls. Reset worker can
+stop waiting on a hung provider and clears all references.
+Search does not scroll or realize unloaded virtualized items.
+
+RUN A PATTERN
+Patterns tab -> pattern -> method -> parameters -> Run method.
+Enums and booleans have dropdowns. Numbers use a decimal dot.
+Blank string fields pass empty strings. Methods run only when
+you press Run. They can change data, submit forms, or close windows.
+Results and errors appear in the bottom log. Refresh the control
+or pattern to see updated state; refresh branch after tree changes.
+
+EXAMPLES
+Button: InvokePattern -> Invoke()
+Text box: ValuePattern -> SetValue(value)
+Checkbox: TogglePattern -> Toggle()
+List item: SelectionItemPattern -> Select()
+Combo: ExpandCollapsePattern -> Expand()
+Slider: RangeValuePattern -> SetValue(value)
+Scroller: Scroll -> choose enum amounts or percent (-1 unchanged)
+Window: SetWindowVisualState -> choose Normal/Minimized/Maximized
+Table: GridPattern -> GetItem(row, column), zero-based
+Selection: Current.GetSelection() returns selected elements.
+Table: Current.GetRowHeaders() returns header elements.
+
+TEXT AND OBJECTS
+TextPattern -> DocumentRange [get] creates @r... in the log.
+Objects -> Refresh objects -> double-click that range.
+Choose GetText(-1), FindText, Move, Select, or another method.
+Methods returning elements create @e... references.
+Double-click an element in Objects to inspect it.
+Use @references in object parameter fields. @selected is the
+selected element when Run is pressed; @null is a null reference.
+Object values: literal text, str:text, int:42, double:1.5,
+bool:true, @reference, @null. Inputs are never evaluated as code.
+Point: x,y in physical screen pixels, e.g. -100,250.
+Text attributes: FontNameAttribute or another dropdown entry.
+
+RECOVERY
+If an element vanishes, pick it again.
+If a provider waits on a dialog, respond to the target dialog.
+Reset worker ends only the helper process and clears references.
+It does not undo an action or guarantee its cancellation.
+No method is automatically retried after an error.
+
+SCOPE
+Uses the managed .NET UIAutomationClient API, not every native
+Inspect.exe feature. No MSAA view, native-only modern pattern
+extensions, event tracing, or custom COM patterns.
+Only controls exposed by an application's provider are visible.
+For elevated targets use the same permitted integrity level.
+No SDK/modules; no automatic elevation or policy changes.
+
+Open demo creates a disposable window for trying patterns.
+The script header includes full command-line help and SelfTest.
+'@
+$helpTab.Controls.Add($helpBox)
+
+function Clear-MethodEditor {
+    $runButton.Enabled = $false; $methodCombo.Items.Clear(); $script:ParameterEditors = @()
+    foreach ($control in @($parameterPanel.Controls)) { $control.Dispose() }
+    $parameterPanel.Controls.Clear(); $parameterPanel.RowStyles.Clear(); $parameterPanel.RowCount = 0
+    $patternPropertyGrid.Rows.Clear()
+}
+function Update-BusyControls {
+    $available = ($null -eq $script:Pending -and $script:WorkerReady)
+    $tree.Enabled = $available; $patternCombo.Enabled = $available
+    $methodCombo.Enabled = $available; $parameterPanel.Enabled = $available
+    $viewCombo.Enabled = $available
+    $pickModeCombo.Enabled = $available; $searchOptions.Enabled = $available
+    $filterGrid.Enabled = $available; $searchButtons.Enabled = $available
+    $searchButton.Enabled = $available
+    $runButton.Enabled = ($available -and $null -ne $script:PatternData -and $null -ne $methodCombo.SelectedItem -and $methodCombo.SelectedItem.Supported)
+}
+function Stop-Engine {
+    $script:Pending = $null; $script:ReadTask = $null; $script:WorkerReady = $false
+    if ($null -ne $script:Engine) {
+        try { if (-not $script:Engine.HasExited) { $script:Engine.Kill(); [void]$script:Engine.WaitForExit(2000) } } catch { }
+        try { if ($null -ne $script:InputWriter) { $script:InputWriter.Dispose() }; $script:Engine.Dispose() } catch { }
+    }
+    $script:InputWriter = $null; $script:Engine = $null; $script:ErrorTask = $null
+}
+function Start-Engine {
+    Stop-Engine
+    $workerArgs = '-MTA -File "{0}" -Worker -OwnerProcessId {1} -MaxChildren {2} -PickNodeLimit {3} -SearchNodeLimit {4}' -f $script:ThisFile, $PID, $MaxChildren, $PickNodeLimit, $SearchNodeLimit
+    $script:Engine = Start-ThisScriptProcess $workerArgs -Redirect
+    $script:InputWriter = [IO.StreamWriter]::new($script:Engine.StandardInput.BaseStream, [Text.UTF8Encoding]::new($false))
+    $script:InputWriter.AutoFlush = $true
+    $script:ErrorTask = $script:Engine.StandardError.ReadToEndAsync()
+    Send-EngineRequest @{ Op = 'Hello' } {
+        param($data)
+        if ($data.Apartment -ne 'MTA') { throw 'Worker did not initialize in MTA.' }
+        $script:WorkerReady = $true
+        $filterPropertyColumn.Items.Clear()
+        foreach ($field in @($data.SearchFields)) { [void]$filterPropertyColumn.Items.Add([string]$field) }
+        if ($filterGrid.Rows.Count -eq 0) { [void]$filterGrid.Rows.Add([object[]]@('Name', 'Contains', '')) }
+        Request-Root
+    } 'Starting automation engine'
+}
+function Send-EngineRequest($Request, [scriptblock]$OnSuccess, [string]$Label, [scriptblock]$OnFailure = $null) {
+    if ($null -ne $script:Pending) { Set-Status ('Busy: ' + $script:Pending.Label + '. Wait or use Reset worker.'); return $false }
+    if ($null -eq $script:Engine -or $script:Engine.HasExited) { Add-Log 'Worker is not running. Press Reset worker.'; return $false }
+    try {
+        $json = ConvertTo-Json -InputObject $Request -Depth 12 -Compress
+        $script:InputWriter.WriteLine($json)
+        $script:ReadTask = $script:Engine.StandardOutput.ReadLineAsync()
+        $script:Pending = @{ OnSuccess = $OnSuccess; OnFailure = $OnFailure; Label = $Label; Started = [DateTime]::UtcNow }
+        if ($Request.Op -in @('Pick', 'PickFocused', 'Inspect', 'Parent')) {
+            # An unsuccessful selection must not leave an old action armed.
+            $script:PatternData = $null; $script:ActionTarget = $null
+        }
+        Update-BusyControls
+        Set-Status ($Label + '...')
+        return $true
+    } catch {
+        $script:Pending = $null
+        Update-BusyControls
+        Add-Log (Get-ErrorMessage $_); Set-Status 'Worker communication failed. Press Reset worker.'
+        if ($null -ne $OnFailure) { & $OnFailure }
+        return $false
+    }
+}
+function Add-ElementNode($Summary, $Collection) {
+    $node = [Windows.Forms.TreeNode]::new([string]$Summary.Label)
+    $node.Tag = [pscustomobject]@{ Ref = [string]$Summary.Ref; Loaded = $false; Loading = $false }
+    $node.ToolTipText = 'AutomationId: ' + $Summary.AutomationId + '; PID: ' + $Summary.ProcessId
+    [void]$node.Nodes.Add([Windows.Forms.TreeNode]::new('Expand to load children'))
+    [void]$Collection.Add($node)
+    return $node
+}
+function Request-Root {
+    [void](Send-EngineRequest @{ Op = 'Root' } {
+        param($data)
+        $script:SuppressSelection = $true
+        $tree.Nodes.Clear(); $node = Add-ElementNode $data $tree.Nodes
+        $script:SuppressSelection = $false
+        $node.Expand()
+    } 'Loading Desktop')
+}
+function Load-TreeChildren($Node) {
+    if ($null -eq $Node.Tag -or $Node.Tag.Loaded -or $Node.Tag.Loading) { return }
+    $targetNode = $Node
+    $callback = {
+        param($data)
+        $targetNode.Nodes.Clear(); $targetNode.Tag.Loaded = $true; $targetNode.Tag.Loading = $false
+        foreach ($item in @($data.Items)) { $null = Add-ElementNode $item $targetNode.Nodes }
+        if ($data.Truncated) { [void]$targetNode.Nodes.Add([Windows.Forms.TreeNode]::new('Limit reached. Relaunch with a larger -MaxChildren.')) }
+        $targetNode.Expand()
+    }.GetNewClosure()
+    $failure = { $targetNode.Tag.Loading = $false }.GetNewClosure()
+    $accepted = Send-EngineRequest @{ Op = 'Children'; Ref = $Node.Tag.Ref; View = [string]$viewCombo.SelectedItem } $callback 'Loading branch' $failure
+    if ($accepted) { $Node.Tag.Loading = $true }
+}
+function Apply-Inspection($Data) {
+    $script:Inspection = $Data; $script:ActionTarget = $null; $script:PatternData = $null
+    $selectionLabel.Text = '{0} | AutomationId: {1} | PID: {2}' -f $Data.Summary.Label, $Data.Summary.AutomationId, $Data.Summary.ProcessId
+    $propertyGrid.Rows.Clear()
+    foreach ($prop in @($Data.Properties)) { [void]$propertyGrid.Rows.Add([object[]]@([string]$prop.Name, [string]$prop.Value)) }
+    $script:SuppressSelection = $true
+    Clear-MethodEditor; $patternCombo.Items.Clear()
+    foreach ($pattern in @($Data.Patterns)) { [void]$patternCombo.Items.Add($pattern) }
+    $methodHint.Text = 'Choose a pattern to load its methods and current state.'
+    if ($patternCombo.Items.Count -eq 0) { $methodHint.Text = 'No managed UI Automation patterns are exposed by this control.' }
+    $script:SuppressSelection = $false
+    Set-Status ('Selected ' + $Data.Summary.Ref + '. Choose a pattern to continue.')
+}
+function Show-PickedInspection($Data) {
+    Apply-Inspection $Data
+    if ($null -ne $Data.PickInfo) {
+        $info = $Data.PickInfo; $hitsGrid.Rows.Clear()
+        foreach ($hit in @($info.Candidates)) {
+            [void]$hitsGrid.Rows.Add([object[]]@([string]$hit.Ref, [string]$hit.Name, [string]$hit.ControlType, [string]$hit.AutomationId, [string]$hit.Depth, [string]$hit.Interactive))
+        }
+        $hitsLabel.Text = '{0} candidates at last pick ({1}); {2} nodes scanned. Mode: {3}.' -f @($info.Candidates).Count, (Get-Date -Format 'HH:mm:ss'), $info.Stats.Scanned, $info.Mode
+        if ($info.Stats.Limit) { $hitsLabel.Text += ' Partial scan: ' + $info.Stats.Limit + '.' }
+        if ($info.Stats.Errors) { $hitsLabel.Text += ' Provider errors: ' + $info.Stats.Errors + '.' }
+        if ($info.Notice) { Add-Log $info.Notice; Set-Status $info.Notice }
+    }
+    $script:SuppressSelection = $true
+    $existing = @($tree.Nodes | Where-Object { $null -ne $_.Tag -and $_.Tag.Ref -eq $Data.Summary.Ref })
+    if ($existing.Count -gt 0) { $node = $existing[0] } else { $node = Add-ElementNode $Data.Summary $tree.Nodes }
+    $tree.SelectedNode = $node; $node.EnsureVisible()
+    $script:SuppressSelection = $false
+    if ($highlightCheck.Checked) { Show-Outline }
+}
+function Pick-Control {
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation, or use Reset worker.'; return }
+    $outline.Hide()
+    $point = [DTORadar.NativeForm]::CursorPoint()
+    [void](Send-EngineRequest @{ Op = 'Pick'; X = $point.X; Y = $point.Y; Mode = [string]$pickModeCombo.SelectedItem } { param($data) Show-PickedInspection $data } 'Picking control')
+}
+function Pick-FocusedControl {
+    [void](Send-EngineRequest @{ Op = 'PickFocused' } { param($data) Show-PickedInspection $data } 'Picking keyboard-focused control')
+}
+function Open-ResultElement($Grid) {
+    if ($null -eq $Grid.CurrentRow -or $null -ne $script:Pending) { return }
+    $ref = [string]$Grid.CurrentRow.Cells[0].Value
+    [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $ref } { param($data) Show-PickedInspection $data; $tabs.SelectedTab = $patternTab } 'Inspecting result')
+}
+function Copy-ResultReference($Grid) {
+    if ($null -ne $Grid.CurrentRow) { [Windows.Forms.Clipboard]::SetText([string]$Grid.CurrentRow.Cells[0].Value) }
+}
+function Request-ControlSearch {
+    if ($null -ne $script:Pending) { return }
+    [void]$filterGrid.EndEdit()
+    if ($searchScope.SelectedItem -ne 'Desktop' -and $null -eq $script:Inspection) { Set-Status 'Select a control/document/window first, or choose Desktop scope.'; return }
+    $filters = @()
+    foreach ($row in $filterGrid.Rows) {
+        $filters += @{ Property = [string]$row.Cells[0].Value; Operator = [string]$row.Cells[1].Value; Value = [string]$row.Cells[2].Value }
+    }
+    $combine = 'All'; if ($searchCombine.SelectedIndex -eq 1) { $combine = 'Any' }
+    $ref = ''; if ($null -ne $script:Inspection) { $ref = $script:Inspection.Summary.Ref }
+    $request = @{ Op = 'Search'; Ref = $ref; Scope = [string]$searchScope.SelectedItem; View = [string]$searchView.SelectedItem
+        Filters = $filters; Combine = $combine; MatchCase = $searchCase.Checked; VisibleOnly = $searchVisible.Checked
+        MaxResults = [int]$searchMax.Value; Seconds = [int]$searchSeconds.Value }
+    $searchGrid.Rows.Clear(); $searchSummary.Text = 'Searching... Results will refer to the scope selected when this search started.'
+    $failed = { $searchSummary.Text = 'Search failed. See log for the error; no new results are available.' }
+    [void](Send-EngineRequest $request {
+        param($data)
+        foreach ($item in @($data.Items)) {
+            [void]$searchGrid.Rows.Add([object[]]@([string]$item.Ref, [string]$item.Name, [string]$item.ControlType, [string]$item.AutomationId, [string]$item.ClassName, [string]$item.ProcessId, [string]$item.Matched))
+        }
+        $stats = $data.Stats
+        $text = '{0} matches; {1} nodes; {2:n1}s. Root: {3} ({4}, {5}).' -f @($data.Items).Count, $stats.Scanned, ($stats.Milliseconds / 1000.0), $data.Root.Label, $data.Scope, $data.View
+        if ($stats.Limit) { $text += ' Stopped at ' + $stats.Limit + '; results are partial.' }
+        if ($stats.Errors -or $data.FieldErrors) { $text += ' Read errors: ' + ($stats.Errors + $data.FieldErrors) + '; results may be incomplete.' }
+        if (@($data.Items).Count -eq 0) { $text += ' Check the scope/filters or try Raw view. Controls must be exposed by the application.' }
+        $searchSummary.Text = $text; Add-Log $text; Set-Status 'Search finished. Double-click a result to inspect it.'
+    } 'Searching controls' $failed)
+}
+function Copy-SearchResults {
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add((@($searchGrid.Columns | ForEach-Object { $_.HeaderText }) -join "`t"))
+    foreach ($row in $searchGrid.Rows) {
+        $lines.Add((@($row.Cells | ForEach-Object { ([string]$_.Value) -replace '[\r\n\t]+', ' ' }) -join "`t"))
+    }
+    [Windows.Forms.Clipboard]::SetText(($lines -join [Environment]::NewLine)); Set-Status 'Search results copied as tab-separated text.'
+}
+function Show-Outline {
+    if ($null -eq $script:Inspection -or $null -eq $script:Inspection.Bounds) { return }
+    $b = $script:Inspection.Bounds
+    $outline.Bounds = [Drawing.Rectangle]::new([int][Math]::Floor($b.X), [int][Math]::Floor($b.Y), [Math]::Max(5, [int][Math]::Ceiling($b.Width)), [Math]::Max(5, [int][Math]::Ceiling($b.Height)))
+    $outline.Show(); $outline.Invalidate(); $script:OutlineUntil = [DateTime]::UtcNow.AddMilliseconds(1400)
+}
+function Refresh-Inspection {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $script:Inspection.Summary.Ref } { param($data) Apply-Inspection $data } 'Refreshing control')
+    }
+}
+function Apply-PatternData($Data) {
+    $script:PatternData = $Data
+    $script:SuppressSelection = $true
+    Clear-MethodEditor
+    foreach ($method in @($Data.Methods)) { [void]$methodCombo.Items.Add($method) }
+    foreach ($prop in @($Data.Properties)) { [void]$patternPropertyGrid.Rows.Add([object[]]@([string]$prop.Name, [string]$prop.Value)) }
+    $script:SuppressSelection = $false
+    if ($methodCombo.Items.Count -gt 0) { $methodCombo.SelectedIndex = 0 } else { $methodHint.Text = 'This pattern has properties only; no callable methods.' }
+}
+function Request-SelectedPattern {
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation before choosing a pattern.'; return }
+    $runButton.Enabled = $false; $script:PatternData = $null; $script:ActionTarget = $null
+    $pattern = $patternCombo.SelectedItem
+    if ($null -eq $pattern -or $null -eq $script:Inspection) { return }
+    if ($pattern.Id -eq -1) {
+        $script:ActionTarget = @{ Kind = 'Range'; Ref = $pattern.Ref; PatternId = 0 }
+        [void](Send-EngineRequest @{ Op = 'Range'; Ref = $pattern.Ref } { param($data) Apply-PatternData $data } 'Reading text range methods')
+    } else {
+        $script:ActionTarget = @{ Kind = 'Pattern'; Ref = $script:Inspection.Summary.Ref; PatternId = $pattern.Id }
+        [void](Send-EngineRequest @{ Op = 'Pattern'; Ref = $script:ActionTarget.Ref; PatternId = $pattern.Id } { param($data) Apply-PatternData $data } 'Reading pattern')
+    }
+}
+function Build-ParameterEditor {
+    foreach ($control in @($parameterPanel.Controls)) { $control.Dispose() }
+    $parameterPanel.Controls.Clear(); $parameterPanel.RowStyles.Clear(); $parameterPanel.RowCount = 0
+    $script:ParameterEditors = @(); $runButton.Enabled = $false
+    $method = $methodCombo.SelectedItem
+    if ($null -eq $method) { return }
+    $methodHint.Text = '{0} -> {1}. Hover a parameter for help.' -f $method.Label, $method.ReturnType
+    if (-not $method.Supported) { $methodHint.Text = 'One or more parameter types are not supported by this editor.' }
+    $row = 0
+    foreach ($parameter in @($method.Parameters)) {
+        $parameterPanel.RowCount++
+        [void]$parameterPanel.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 44))
+        $label = [Windows.Forms.Label]::new(); $label.Text = $parameter.Name + ' (' + ($parameter.Type -replace '^.*\.', '') + ')'
+        $label.Dock = 'Fill'; $label.AutoEllipsis = $true; $label.TextAlign = 'MiddleLeft'
+        if ($parameter.Kind -in @('Choice', 'EditableChoice')) {
+            $editor = [Windows.Forms.ComboBox]::new()
+            $editor.DropDownStyle = 'DropDownList'
+            if ($parameter.Kind -eq 'EditableChoice') { $editor.DropDownStyle = 'DropDown' }
+            foreach ($choice in @($parameter.Choices)) { [void]$editor.Items.Add([string]$choice) }
+            if ($parameter.Kind -eq 'Choice') { $editor.SelectedItem = [string]$parameter.Default } else { $editor.Text = [string]$parameter.Default }
+        } else {
+            $editor = [Windows.Forms.TextBox]::new(); $editor.Text = [string]$parameter.Default
+            if ($parameter.Type -eq 'System.String') { $editor.Multiline = $true; $editor.AcceptsReturn = $true; $editor.ScrollBars = 'Vertical' }
+        }
+        $editor.Dock = 'Fill'; $toolTip.SetToolTip($editor, [string]$parameter.Hint); $toolTip.SetToolTip($label, [string]$parameter.Hint)
+        $parameterPanel.Controls.Add($label, 0, $row); $parameterPanel.Controls.Add($editor, 1, $row)
+        $script:ParameterEditors += $editor; $row++
+    }
+    $runButton.Enabled = ($method.Supported -and $null -eq $script:Pending -and $null -ne $script:PatternData)
+}
+function Invoke-SelectedMethod {
+    $method = $methodCombo.SelectedItem
+    if ($null -eq $method -or $null -eq $script:ActionTarget -or $null -eq $script:PatternData -or $null -ne $script:Pending) { return }
+    $inputValues = @($script:ParameterEditors | ForEach-Object { [string]$_.Text })
+    $target = $script:ActionTarget
+    $request = @{
+        Op = 'Invoke'; TargetKind = $target.Kind; Ref = $target.Ref; PatternId = $target.PatternId
+        Token = $method.Token; Scope = $method.Scope; Arguments = $inputValues; SelectedRef = $script:Inspection.Summary.Ref
+    }
+    $actionDescription = $target.Ref + ' :: ' + $method.Label
+    $callback = {
+        param($data)
+        Add-Log ($actionDescription + [Environment]::NewLine + $data.Text)
+        Set-Status 'Method completed. Refresh to inspect changed state; see Objects for returned references.'
+    }.GetNewClosure()
+    [void](Send-EngineRequest $request $callback ('Running ' + $method.Name))
+}
+function Request-Objects {
+    [void](Send-EngineRequest @{ Op = 'Objects' } {
+        param($data)
+        $objectGrid.Rows.Clear()
+        foreach ($item in @($data.Items)) { [void]$objectGrid.Rows.Add([object[]]@([string]$item.Ref, [string]$item.Kind, [string]$item.Label)) }
+    } 'Reading object references')
+}
+function Open-SelectedObject {
+    if ($null -eq $objectGrid.CurrentRow -or $null -ne $script:Pending) { return }
+    $row = $objectGrid.CurrentRow; $ref = [string]$row.Cells[0].Value; $kind = [string]$row.Cells[1].Value
+    if ($kind -eq 'Element') {
+        [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $ref } { param($data) Show-PickedInspection $data; $tabs.SelectedTab = $propertyTab } 'Opening element')
+    } elseif ($kind -eq 'Range') {
+        if ($null -eq $script:Inspection) { Add-Log 'Select an element first.'; return }
+        $script:SuppressSelection = $true
+        [void]$patternCombo.Items.Add([pscustomobject]@{ Id = -1; Name = 'TextPatternRange ' + $ref; Ref = $ref })
+        $patternCombo.SelectedIndex = $patternCombo.Items.Count - 1
+        $script:SuppressSelection = $false
+        $tabs.SelectedTab = $patternTab; Request-SelectedPattern
+    }
+}
+
+$toolbar.Controls.Add((New-Button 'Pick in 3s' {
+    if ($null -eq $script:Pending) { $script:PickFocusedNext = $false; $script:PickAt = [DateTime]::UtcNow.AddSeconds(3); Set-Status 'Move the pointer over the target. Picking in 3 seconds...' }
+}))
+$toolbar.Controls.Add((New-Button 'Focus in 3s' {
+    if ($null -eq $script:Pending) { $script:PickFocusedNext = $true; $script:PickAt = [DateTime]::UtcNow.AddSeconds(3); Set-Status 'Focus the target control. Capturing keyboard focus in 3 seconds...' }
+}))
+$pickModeCombo = [Windows.Forms.ComboBox]::new(); $pickModeCombo.Width = 128; $pickModeCombo.DropDownStyle = 'DropDownList'
+$pickModeCombo.Items.AddRange([object[]]@('Prefer controls', 'Deepest', 'Provider hit')); $pickModeCombo.SelectedIndex = 0
+$toolbar.Controls.Add($pickModeCombo); $toolTip.SetToolTip($pickModeCombo, 'Default deep picking prefers interactive descendants; Deepest also selects text leaves.')
+$toolbar.Controls.Add((New-Button 'Search controls' { $tabs.SelectedTab = $searchTab }))
+$toolbar.Controls.Add((New-Button 'Refresh control' { Refresh-Inspection }))
+$toolbar.Controls.Add((New-Button 'Parent' {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Parent'; Ref = $script:Inspection.Summary.Ref; View = [string]$viewCombo.SelectedItem } { param($data) Show-PickedInspection $data } 'Getting parent')
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Refresh branch' {
+    if ($null -eq $script:Pending -and $null -ne $tree.SelectedNode -and $null -ne $tree.SelectedNode.Tag) {
+        $tree.SelectedNode.Tag.Loaded = $false; Load-TreeChildren $tree.SelectedNode
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Set focus' {
+    if ($null -ne $script:Inspection) {
+        [void](Send-EngineRequest @{ Op = 'Focus'; Ref = $script:Inspection.Summary.Ref } { param($data) Add-Log $data.Text } 'Setting keyboard focus')
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Highlight' { Show-Outline }))
+$toolbar.Controls.Add((New-Button 'Copy properties' {
+    if ($null -ne $script:Inspection) {
+        $text = ($script:Inspection.Properties | ForEach-Object { $_.Name + "`t" + $_.Value }) -join [Environment]::NewLine
+        [Windows.Forms.Clipboard]::SetText($text); Set-Status 'Properties copied.'
+    }
+}))
+$toolbar.Controls.Add((New-Button 'Reset worker' {
+    if ($script:Resetting) { return }; $script:Resetting = $true
+    try {
+        $script:PickAt = $null; $outline.Hide()
+        $script:Inspection = $null; $script:ActionTarget = $null; $script:PatternData = $null
+        $script:SuppressSelection = $true; $tree.Nodes.Clear(); $patternCombo.Items.Clear(); Clear-MethodEditor
+        $propertyGrid.Rows.Clear(); $objectGrid.Rows.Clear(); $hitsGrid.Rows.Clear(); $searchGrid.Rows.Clear(); $script:SuppressSelection = $false
+        $hitsLabel.Text = 'Worker reset. Pick again to refresh candidates.'; $searchSummary.Text = 'Worker reset. Select a scope and search again.'
+        $selectionLabel.Text = 'Worker reset. Pick a control again.'
+        Add-Log 'Worker reset; references cleared. Any action already sent to a target may still complete. No action is retried.'
+        Start-Engine
+    } catch { Add-Log (Get-ErrorMessage $_) } finally { $script:Resetting = $false }
+}))
+$toolbar.Controls.Add((New-Button 'Open demo' {
+    $demoProc = Start-ThisScriptProcess ('-STA -File "{0}" -Demo' -f $script:ThisFile)
+    $demoProc.Dispose(); Add-Log 'Opened the disposable demo window. Pick its controls to try patterns.'
+}))
+$viewCombo = [Windows.Forms.ComboBox]::new(); $viewCombo.Width = 90; $viewCombo.DropDownStyle = 'DropDownList'
+$viewCombo.Items.AddRange([object[]]@('Control', 'Content', 'Raw')); $viewCombo.SelectedIndex = 0; $toolbar.Controls.Add($viewCombo)
+$toolTip.SetToolTip($viewCombo, 'Tree view. Changing this view reloads the Desktop tree.')
+$topCheck = [Windows.Forms.CheckBox]::new(); $topCheck.Text = 'Topmost'; $topCheck.AutoSize = $true
+$topCheck.Add_CheckedChanged({ $form.TopMost = $topCheck.Checked }); $toolbar.Controls.Add($topCheck)
+$highlightCheck = [Windows.Forms.CheckBox]::new(); $highlightCheck.Text = 'Outline on pick'; $highlightCheck.AutoSize = $true; $highlightCheck.Checked = $true
+$toolbar.Controls.Add($highlightCheck)
+
+$tree.Add_BeforeExpand({
+    param($sender, $eventArgs)
+    if ($script:SuppressSelection -or $null -eq $eventArgs.Node.Tag) { return }
+    if (-not $eventArgs.Node.Tag.Loaded) { $eventArgs.Cancel = $true; Load-TreeChildren $eventArgs.Node }
+})
+$tree.Add_AfterSelect({
+    param($sender, $eventArgs)
+    if ($script:SuppressSelection -or $null -eq $eventArgs.Node.Tag) { return }
+    if ($null -ne $script:Pending) { Set-Status 'Busy. Select the control again when the operation completes.'; return }
+    [void](Send-EngineRequest @{ Op = 'Inspect'; Ref = $eventArgs.Node.Tag.Ref } { param($data) Apply-Inspection $data } 'Inspecting control')
+})
+$patternCombo.Add_SelectedIndexChanged({ if (-not $script:SuppressSelection) { Request-SelectedPattern } })
+$methodCombo.Add_SelectedIndexChanged({ if (-not $script:SuppressSelection) { Build-ParameterEditor } })
+$objectGrid.Add_CellDoubleClick({ Open-SelectedObject })
+$hitsGrid.Add_CellDoubleClick({ param($sender, $eventArgs) if ($eventArgs.RowIndex -ge 0) { Open-ResultElement $hitsGrid } })
+$searchGrid.Add_CellDoubleClick({ param($sender, $eventArgs) if ($eventArgs.RowIndex -ge 0) { Open-ResultElement $searchGrid } })
+$filterGrid.Add_DataError({ param($sender, $eventArgs) $eventArgs.ThrowException = $false; Set-Status 'Choose a property and operator from the dropdown lists.' })
+$viewCombo.Add_SelectedIndexChanged({
+    if ($null -ne $script:Pending) { Set-Status 'Wait for the current operation, then refresh the desired branch with this view.'; return }
+    Request-Root
+})
+$form.Add_PickHotKey({ Pick-Control })
+$form.Add_FocusHotKey({ Pick-FocusedControl })
+
+$timer = [Windows.Forms.Timer]::new(); $timer.Interval = 100
+$timer.Add_Tick({
+    try {
+        if ($outline.Visible -and [DateTime]::UtcNow -ge $script:OutlineUntil) { $outline.Hide() }
+        if ($null -ne $script:PickAt -and [DateTime]::UtcNow -ge $script:PickAt) {
+            $script:PickAt = $null
+            if ($script:PickFocusedNext) { Pick-FocusedControl } else { Pick-Control }
+        }
+        if ($null -eq $script:Pending) { return }
+        if ($script:ReadTask.IsCompleted) {
+            $pending = $script:Pending; $script:Pending = $null
+            try {
+                $line = $script:ReadTask.GetAwaiter().GetResult(); $script:ReadTask = $null
+                if ($null -eq $line) {
+                    $details = ''
+                    if ($null -ne $script:ErrorTask -and $script:ErrorTask.IsCompleted) { $details = $script:ErrorTask.GetAwaiter().GetResult() }
+                    throw ('Worker exited. Use Reset worker. ' + $details)
+                }
+                $response = ConvertFrom-Json -InputObject $line
+                if (-not $response.Ok) { throw $response.Error }
+                Set-Status ($pending.Label + ' completed.')
+                & $pending.OnSuccess $response.Data
+            } catch {
+                Add-Log ($pending.Label + ' failed: ' + (Get-ErrorMessage $_)); Set-Status 'Operation failed; see log. A stale control must be selected again.'
+                if ($null -ne $pending.OnFailure) { & $pending.OnFailure }
+            }
+            Update-BusyControls
+        } else {
+            $elapsed = [int]([DateTime]::UtcNow - $script:Pending.Started).TotalSeconds
+            if ($elapsed -ge 10) { Set-Status ('{0}: waiting {1}s. Check the target for a dialog, or use Reset worker.' -f $script:Pending.Label, $elapsed) }
+        }
+    } catch { Add-Log (Get-ErrorMessage $_) }
+})
+$form.Add_Shown({
+    $keys = $form.RegisterPicker()
+    if ($keys -band 1) { Add-Log 'Pointer picker: Ctrl+Shift+F8.' } else { Add-Log 'Ctrl+Shift+F8 is in use. Pick in 3s remains available.' }
+    if ($keys -band 2) { Add-Log 'Pointer picker alias: Ctrl+Shift+8 (digit 8).' } else { Add-Log 'Ctrl+Shift+8 is in use; use F8 or Pick in 3s.' }
+    if ($keys -band 4) { Add-Log 'Keyboard-focus picker: Ctrl+Shift+F9. Tab to a browser control first.' } else { Add-Log 'Ctrl+Shift+F9 is in use; use Focus in 3s.' }
+    try { Start-Engine } catch { Add-Log (Get-ErrorMessage $_); Set-Status 'Startup failed. See log.' }
+    $timer.Start()
+})
+$form.Add_FormClosing({ $timer.Stop(); $outline.Hide(); Stop-Engine })
+try { [Windows.Forms.Application]::Run($form) }
+finally { $timer.Dispose(); $outline.Dispose(); $toolTip.Dispose(); Stop-Engine; $form.Dispose() }
