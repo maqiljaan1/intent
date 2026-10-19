@@ -1,0 +1,895 @@
+Power Apps SVG pie chart generator
+
+A reusable canvas component that draws a pie chart, title, three independently positioned label fields, and a bottom legend in a single SVG Image control.
+
+What you can configure
+
+Slice size: Driven only by the numeric Amount field.
+
+Label 1: Usually the category; can be Inside, Outside, or None.
+
+Label 2: Optional secondary line, such as 7.00M; independently Inside, Outside, or None.
+
+Label 3: Optional third line, such as 56.00%; independently Inside, Outside, or None.
+
+Bottom legend: Uses LegendText, independent of all three slice labels.
+
+Title: Uses ChartTitle; set it to "" to hide it.
+
+Colors: Explicit per-slice colors or an eight-color fallback palette.
+
+Layout: Outside leader lines, space between label blocks, multiple legend rows, recommended height.
+
+Formatting: Labels are supplied as text, so you can format amounts, percentages, dates, or other captions yourself.
+
+
+Each placement property applies to that label field across every slice. For example, Label1 can be Outside and Label2 Inside simultaneously. This version does not provide a different placement override for each individual row.
+
+This is a data-reactive graphic. An SVG loaded into an Image control does not expose individual slices as clickable Power Apps controls, and this package does not implement slice hover tooltips, selection, or drill-through. The Image's OnSelect is for the whole image. Use a native gallery or another control if you later need interactive legend selection.
+
+1. Create the component
+
+Create a blank canvas component named exactly cmpSvgPie. Set its initial Width to 800 and Height to 516. Keep Access app scope off; this implementation uses the component's custom properties.
+
+Create the following custom properties. With enhanced component properties, choose Data and then the indicated Input or Output direction. With the older property dialog, select Input or Output directly. Create inputs first and outputs in the order shown below.
+
+Input properties
+
+Items
+  Data type: Table
+  Default / source: Formula 01 below. This establishes the table schema.
+
+ChartTitle
+  Data type: Text
+  Default / source: "Year exit by category"
+
+Label1Position
+  Data type: Text
+  Default / source: "Outside"
+
+Label2Position
+  Data type: Text
+  Default / source: "Inside"
+
+Label3Position
+  Data type: Text
+  Default / source: "None"
+
+ShowLegend
+  Data type: Boolean
+  Default / source: true
+
+ChartStyle
+  Data type: Record
+  Default / source: Formula 02 below. Keep all record fields.
+
+
+Valid positions are "Inside", "Outside", and "None". Matching is case-insensitive. A blank caption is not drawn, even when its position is enabled. An unknown position is treated as hidden.
+
+Output properties
+
+1
+  Property name: ChartSlices
+  Data type: Table
+  Formula: 03
+
+2
+  Property name: DataMessage
+  Data type: Text
+  Formula: 04
+
+3
+  Property name: ChartLayout
+  Data type: Record
+  Formula: 05
+
+4
+  Property name: SvgMarkup
+  Data type: Text
+  Formula: 06
+
+5
+  Property name: SvgImage
+  Data type: Text
+  Formula: 07
+
+6
+  Property name: RecommendedHeight
+  Data type: Number
+  Formula: 08
+
+
+These outputs are calculated helper properties. Paste each expression into that property's formula bar. Do not prefix an expression with the property name or an equals sign. No Set, UpdateContext, collection, OnStart initialization, or App.Formulas definition is required.
+
+The component-definition name in the formulas is cmpSvgPie. A screen instance may be called cmpSvgPie_1; do not substitute that instance name into the component's internal formulas.
+
+Items schema
+
+Amount
+  Type: Number
+  Example: 7000000
+  Meaning: Raw numeric amount used for slice geometry.
+
+Label1
+  Type: Text
+  Example: "Category A"
+  Meaning: First slice caption.
+
+Label2
+  Type: Text
+  Example: "7.00M"
+  Meaning: Optional second caption.
+
+Label3
+  Type: Text
+  Example: "56.00%"
+  Meaning: Optional third caption.
+
+LegendText
+  Type: Text
+  Example: "North division"
+  Meaning: Separate bottom legend caption.
+
+SliceColor
+  Type: Text
+  Example: "#0F766E"
+  Meaning: Six-digit hex color; blank uses the palette.
+
+InsideTextColor
+  Type: Text
+  Example: "#FFFFFF"
+  Meaning: Six-digit hex color for inside labels; blank uses white.
+
+
+Include all seven columns, even when a text value is "". A table containing formatted text such as "7.00M" in Amount is not valid. Use Amount for the number and Label2 for the formatted display.
+
+The supplied colors are text, not Power Fx Color values. For example, use "#0C7BE8" in this schema, rather than RGBA(12, 123, 232, 1). This package accepts six-digit hex colors; it does not convert a Power Fx Color value or support alpha/transparency in those fields.
+
+2. Add one Image control
+
+Inside cmpSvgPie, add a classic Image control and name it imgPie.
+
+X: 0
+
+Y: 0
+
+Width: Parent.Width
+
+Height: Parent.Height
+
+Image: cmpSvgPie.SvgImage
+
+ImagePosition: ImagePosition.Fit
+
+BorderThickness: 0
+
+AccessibleLabel: Formula 09 below.
+
+
+The SVG URI is created by Formula 07:
+
+
+"data:image/svg+xml;utf8," & EncodeUrl(cmpSvgPie.SvgMarkup)
+
+
+3. Put an instance on a screen
+
+Insert the component on a screen. For an instance named cmpSvgPie_1, start with:
+
+Width: 800
+
+Height: Self.RecommendedHeight
+
+ChartTitle: "Year exit by category"
+
+Label1Position: "Outside"
+
+Label2Position: "Inside"
+
+Label3Position: "None"
+
+ShowLegend: true
+
+
+You can replace the fixed width with a parent-relative width suitable for your screen. RecommendedHeight depends on Width, data, labels, and legend rows; it does not depend on Height, so this height binding is not circular.
+
+At widths below 360, the chart uses a 360-unit logical canvas and scales it down. More width improves readability when using two outside label columns. If you assign a shorter fixed Height, ImagePosition.Fit scales the whole chart down to fit instead of reflowing it into that height. If the component is in an auto-layout container, make sure the container permits its requested height.
+
+Common label setups
+
+Category outside, amount inside
+  Label1Position: "Outside"
+  Label2Position: "Inside"
+  Label3Position: "None"
+
+Category and amount inside
+  Label1Position: "Inside"
+  Label2Position: "Inside"
+  Label3Position: "None"
+
+Three stacked lines outside
+  Label1Position: "Outside"
+  Label2Position: "Outside"
+  Label3Position: "Outside"
+
+Amount only inside
+  Label1Position: "None"
+  Label2Position: "Inside"
+  Label3Position: "None"
+
+Category outside, amount and percentage inside
+  Label1Position: "Outside"
+  Label2Position: "Inside"
+  Label3Position: "Inside"
+
+Legend and title only
+  Label1Position: "None"
+  Label2Position: "None"
+  Label3Position: "None"
+
+
+All lines assigned to the same position are stacked in Label1, Label2, Label3 order. Blank lines take no space. Change LegendText to change the bottom caption without changing these labels.
+
+4. Connect your existing summary table
+
+Formula 10 maps an existing summary directly into the Items schema. It assumes a table named SummaryTable with Category (text) and Total (number). Replace those names with your actual names, then place the formula in the screen instance's Items property. It returns a derived table; it does not create a second stored collection or modify the source.
+
+The example formats Total / 1000000 as 0.00M and calculates percentage against the total of positive rows. If Total is already expressed in millions, use Text(item.Total, "[$-en-US]0.00", "en-US") & "M" instead. Slice proportions work with either unit as long as all Amount values use the same unit.
+
+For a SharePoint single-select Choice category, map item.Category.Value if your summary still holds the Choice record. If the summary already contains category text, use item.Category. Aggregation and filtering belong in the host app or data preparation step. Pass a complete, small summary to this component. SharePoint GroupBy/Sum/ForAll patterns can be nondelegable; this renderer cannot recover records omitted by an upstream delegation limit. Do not assume ClearCollect makes an entire large list available.
+
+5. Style settings
+
+Change the ChartStyle record on the instance to adjust the appearance. Keep its complete schema. You can define a complete style record as a named formula in your app and use Patch(YourStyleRecord, {LabelFontSize: 14}) if you want to override just a few fields. Avoid referencing the same instance's ChartStyle inside its own ChartStyle formula.
+
+Radius: Requested radius; automatically reduced when the available width requires it.
+
+StartAngle: Degrees; -90 starts at 12 o'clock, with slices progressing clockwise.
+
+InsideRadius: Label-anchor distance from the center as a fraction of radius. Default 0.62.
+
+MinInsidePercent: Hide inside labels on slices below this percentage. Default 3; set 0 to remove this threshold.
+
+TitleFontSize: Title size in SVG units.
+
+LabelFontSize: Outside label size and maximum inside label size.
+
+LegendFontSize: Bottom legend size.
+
+OutsideLabelWidth: Requested width of each outside caption column; capped to fit the chart width.
+
+InsideMaxCharacters: Maximum characters per inside line, including the ellipsis.
+
+OutsideMaxCharacters: Maximum characters per outside line; the available width may reduce it further.
+
+LegendMaxCharacters: Maximum characters per legend caption; the available width may reduce it further.
+
+LegendColumns: Requested number of bottom legend columns; reduced to fit the available width.
+
+BackgroundColor: Six-digit hex chart background.
+
+TextColor: Title, outside label, and legend color.
+
+LeaderLineColor: Color of outside label connectors.
+
+SliceBorderColor: Border/separator color.
+
+SliceBorderWidth: Border width; 0 removes separators.
+
+
+Data and layout behavior
+
+- One positive slice renders as a full circle, without a radial seam.
+- Multiple slices use two arc segments each, including slices larger than 50%.
+- Zero and blank amounts are excluded from the pie and legend. An empty or all-zero input displays a message.
+- Any negative amount or an error in Amount displays a message instead of drawing a misleading pie from only the remaining values.
+- Outside labels stay near their slice position when space allows. A deterministic spacing calculation separates blocks on each side, and the canvas grows vertically when needed. Connector lines may share or cross portions of their routes in crowded charts; they are not a general-purpose graph-routing system.
+- Inside labels are scaled down to fit an estimated safe area, clipped to their slice as a final guard, and hidden if fitting would require a font smaller than 8 SVG units. Very wide glyphs can still be clipped. Use Outside for small slices or long captions. Setting MinInsidePercent to 0 does not disable the 8-unit legibility limit.
+- Long visible captions are shortened with an ellipsis. The Image's AccessibleLabel includes complete legend captions, raw amounts, and percentages.
+- Text containing ampersands, angle brackets, apostrophes, or quotation marks is safe in the SVG text nodes. SVG coordinates use an explicit English numeric format, independent of the viewer's decimal separator.
+- Table order controls slice order and the fallback color sequence. Supply explicit SliceColor values to keep category colors stable when the table is sorted or filtered.
+- Each input row is one slice. Repeated category names are not automatically grouped.
+- Use this for a small chart summary. The geometry and label-spacing formulas use repeated table scans; a pie with hundreds of categories will be slow and difficult to read.
+
+Validation status
+
+The delivered expressions were parsed and evaluated with a local subset evaluator to generate the supplied SVG previews. XML, geometry, label spacing, special characters, and 48 data/layout scenarios were checked. The previews were rendered and visually inspected.
+
+This has not been run or type-checked in Microsoft Power Apps Studio. The local evaluator is not Microsoft's Power Fx engine. After installing, check the sample first in Studio and in the players you use, then connect your real data. The package contains formulas and instructions, not an importable .msapp or component-library export.
+
+If Studio reports an unrecognized custom field, check that the input table/record defaults were pasted first and match the documented schema. If it reports an unrecognized helper property, check the six output property names and their data types. The formulas use comma argument separators; a Studio authoring locale that uses decimal commas may require semicolon argument separators. Do not globally replace commas inside quoted SVG or number-format strings.
+
+Complete formulas
+
+All formulas are included below. SVG-Pie-Generator-Formulas.txt contains the same formulas in a separate file for copying. Paste each formula into its indicated property, in numerical order. Formula 10 is optional and replaces the sample Items mapping on a screen instance.
+
+01 — cmpSvgPie.Items
+
+Input · Table · sample/default schema
+
+
+Table(
+    {
+        Amount: 7000000,
+        Label1: "Category A",
+        Label2: "7.00M",
+        Label3: "56.00%",
+        LegendText: "North division",
+        SliceColor: "#0F766E",
+        InsideTextColor: "#FFFFFF"
+    },
+    {
+        Amount: 3500000,
+        Label1: "Category B",
+        Label2: "3.50M",
+        Label3: "28.00%",
+        LegendText: "South division",
+        SliceColor: "#2563EB",
+        InsideTextColor: "#FFFFFF"
+    },
+    {
+        Amount: 2000000,
+        Label1: "Category C",
+        Label2: "2.00M",
+        Label3: "16.00%",
+        LegendText: "Central division",
+        SliceColor: "#B45309",
+        InsideTextColor: "#FFFFFF"
+    }
+)
+
+
+02 — cmpSvgPie.ChartStyle
+
+Input · Record · default appearance
+
+
+{
+    Radius: 170,
+    StartAngle: -90,
+    InsideRadius: 0.62,
+    MinInsidePercent: 3,
+    TitleFontSize: 24,
+    LabelFontSize: 16,
+    LegendFontSize: 14,
+    OutsideLabelWidth: 160,
+    InsideMaxCharacters: 14,
+    OutsideMaxCharacters: 22,
+    LegendMaxCharacters: 26,
+    LegendColumns: 3,
+    BackgroundColor: "#FFFFFF",
+    TextColor: "#1F2937",
+    LeaderLineColor: "#94A3B8",
+    SliceBorderColor: "#FFFFFF",
+    SliceBorderWidth: 2
+}
+
+
+03 — cmpSvgPie.ChartSlices
+
+Output · Table
+
+
+With(
+    {
+        source: Filter(
+            cmpSvgPie.Items As row,
+            IfError(Coalesce(row.Amount, 0), 0) > 0
+        ),
+        position1: Lower(Trim(cmpSvgPie.Label1Position)),
+        position2: Lower(Trim(cmpSvgPie.Label2Position)),
+        position3: Lower(Trim(cmpSvgPie.Label3Position)),
+        rotation: Radians(Coalesce(cmpSvgPie.ChartStyle.StartAngle, -90))
+    },
+    With(
+        { total: Sum(source As row, row.Amount) },
+        ForAll(
+            Sequence(CountRows(source)) As counter,
+            With(
+                {
+                    item: Index(source, counter.Value),
+                    preceding: Coalesce(
+                        Sum(FirstN(source, counter.Value - 1) As prior, prior.Amount),
+                        0
+                    )
+                },
+                With(
+                    {
+                        fraction: item.Amount / total,
+                        angleStart: rotation + 2 * Pi() * preceding / total,
+                        angleEnd: rotation + 2 * Pi() * (preceding + item.Amount) / total,
+                        labelLines: Table(
+                            { LineNo: 1, Caption: Coalesce(item.Label1, ""), Position: position1 },
+                            { LineNo: 2, Caption: Coalesce(item.Label2, ""), Position: position2 },
+                            { LineNo: 3, Caption: Coalesce(item.Label3, ""), Position: position3 }
+                        )
+                    },
+                    With(
+                        { angleMid: (angleStart + angleEnd) / 2 },
+                        {
+                            SliceNo: counter.Value,
+                            Amount: item.Amount,
+                            Fraction: fraction,
+                            AngleStart: angleStart,
+                            AngleEnd: angleEnd,
+                            UnitX: Cos(angleMid),
+                            UnitY: Sin(angleMid),
+                            Side: If(Cos(angleMid) >= 0, 1, -1),
+                            SliceColor: If(
+                                IsMatch(Coalesce(item.SliceColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete),
+                                item.SliceColor,
+                                Switch(
+                                    Mod(counter.Value - 1, 8),
+                                    0, "#0F766E",
+                                    1, "#2563EB",
+                                    2, "#B45309",
+                                    3, "#7C3AED",
+                                    4, "#BE185D",
+                                    5, "#0369A1",
+                                    6, "#4D7C0F",
+                                    "#475569"
+                                )
+                            ),
+                            InsideTextColor: If(
+                                IsMatch(Coalesce(item.InsideTextColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete),
+                                item.InsideTextColor,
+                                "#FFFFFF"
+                            ),
+                            InsideLines: Filter(
+                                labelLines As line,
+                                line.Position = "inside" && !IsBlank(Trim(line.Caption))
+                            ),
+                            OutsideLines: Filter(
+                                labelLines As line,
+                                line.Position = "outside" && !IsBlank(Trim(line.Caption))
+                            ),
+                            LegendText: Coalesce(
+                                item.LegendText,
+                                item.Label1,
+                                "Slice " & Text(counter.Value, "0", "en-US")
+                            )
+                        }
+                    )
+                )
+            )
+        )
+    )
+)
+
+
+04 — cmpSvgPie.DataMessage
+
+Output · Text
+
+
+If(
+    CountIf(cmpSvgPie.Items As row, IsError(row.Amount)) > 0,
+    "Fix the errors in the Amount column.",
+    CountIf(cmpSvgPie.Items As row, IfError(row.Amount < 0, false)) > 0,
+    "Pie charts cannot display negative amounts.",
+    IsEmpty(cmpSvgPie.ChartSlices),
+    "No positive values to display.",
+    ""
+)
+
+
+05 — cmpSvgPie.ChartLayout
+
+Output · Record
+
+
+With(
+    {
+        data: cmpSvgPie.ChartSlices,
+        style: cmpSvgPie.ChartStyle,
+        canvasWidth: Max(360, cmpSvgPie.Width),
+        padding: 20
+    },
+    With(
+        {
+            labelFont: Max(8, Min(32, Coalesce(style.LabelFontSize, 16))),
+            titleFont: Max(12, Min(48, Coalesce(style.TitleFontSize, 24))),
+            legendFont: Max(8, Min(28, Coalesce(style.LegendFontSize, 14))),
+            outsideData: Filter(data As slice, CountRows(slice.OutsideLines) > 0),
+            legendColumns: Max(
+                1,
+                Min(
+                    RoundDown(Coalesce(style.LegendColumns, 3), 0),
+                    Max(1, CountRows(data)),
+                    Max(1, RoundDown((canvasWidth - 2 * padding) / 140, 0))
+                )
+            )
+        },
+        With(
+            {
+                gutter: If(
+                    IsEmpty(outsideData),
+                    0,
+                    Min(canvasWidth * 0.25, Max(60, Coalesce(style.OutsideLabelWidth, 160)))
+                ),
+                lineHeight: labelFont * 1.3,
+                outsideRowHeight: Max(
+                    1,
+                    Coalesce(Max(outsideData As slice, CountRows(slice.OutsideLines)), 1)
+                ) * labelFont * 1.3 + 16,
+                leftCount: CountIf(outsideData As slice, slice.Side = -1),
+                rightCount: CountIf(outsideData As slice, slice.Side = 1),
+                titleBand: If(IsBlank(Trim(cmpSvgPie.ChartTitle)), 0, titleFont + 22),
+                legendRowHeight: Max(26, legendFont * 1.6)
+            },
+            With(
+                {
+                    radius: Max(
+                        24,
+                        Min(
+                            Max(24, Coalesce(style.Radius, 170)),
+                            (canvasWidth - 2 * padding - 2 * gutter - If(gutter > 0, 60, 0)) / 2
+                        )
+                    ),
+                    legendBand: If(
+                        cmpSvgPie.ShowLegend && CountRows(data) > 0 && IsBlank(cmpSvgPie.DataMessage),
+                        24 + RoundUp(CountRows(data) / legendColumns, 0) * legendRowHeight,
+                        0
+                    )
+                },
+                With(
+                    {
+                        plotHeight: Max(
+                            160,
+                            2 * radius + 2 * padding,
+                            Max(leftCount, rightCount) * outsideRowHeight + 2 * padding
+                        ),
+                        plotTop: padding + titleBand
+                    },
+                    {
+                        Width: canvasWidth,
+                        Height: plotTop + plotHeight + legendBand + padding,
+                        Padding: padding,
+                        CenterX: canvasWidth / 2,
+                        CenterY: plotTop + plotHeight / 2,
+                        Radius: radius,
+                        LabelFontSize: labelFont,
+                        TitleFontSize: titleFont,
+                        LegendFontSize: legendFont,
+                        LineHeight: lineHeight,
+                        OutsideRowHeight: outsideRowHeight,
+                        OutsideTop: plotTop + padding + outsideRowHeight / 2,
+                        OutsideBottom: plotTop + plotHeight - padding - outsideRowHeight / 2,
+                        LeftLabelX: padding + gutter,
+                        RightLabelX: canvasWidth - padding - gutter,
+                        LeftCount: leftCount,
+                        RightCount: rightCount,
+                        InsideRadius: Max(0, Min(0.85, Coalesce(style.InsideRadius, 0.62))),
+                        MinInsidePercent: Max(0, Min(100, Coalesce(style.MinInsidePercent, 3))),
+                        TitleMaxCharacters: Max(4, RoundDown((canvasWidth - 2 * padding) / (titleFont * 0.65), 0)),
+                        InsideMaxCharacters: Max(2, RoundDown(Coalesce(style.InsideMaxCharacters, 14), 0)),
+                        OutsideMaxCharacters: Max(
+                            2,
+                            Min(
+                                RoundDown(Coalesce(style.OutsideMaxCharacters, 22), 0),
+                                RoundDown(gutter / (labelFont * 0.65), 0)
+                            )
+                        ),
+                        LegendMaxCharacters: Max(
+                            2,
+                            Min(
+                                RoundDown(Coalesce(style.LegendMaxCharacters, 26), 0),
+                                RoundDown(((canvasWidth - 2 * padding) / legendColumns - 28) / (legendFont * 0.65), 0)
+                            )
+                        ),
+                        LegendTop: plotTop + plotHeight + 24,
+                        LegendColumns: legendColumns,
+                        LegendCellWidth: (canvasWidth - 2 * padding) / legendColumns,
+                        LegendRowHeight: legendRowHeight,
+                        BackgroundColor: If(IsMatch(Coalesce(style.BackgroundColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete), style.BackgroundColor, "#FFFFFF"),
+                        TextColor: If(IsMatch(Coalesce(style.TextColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete), style.TextColor, "#1F2937"),
+                        LeaderLineColor: If(IsMatch(Coalesce(style.LeaderLineColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete), style.LeaderLineColor, "#94A3B8"),
+                        SliceBorderColor: If(IsMatch(Coalesce(style.SliceBorderColor, ""), "#[0-9A-Fa-f]{6}", MatchOptions.Complete), style.SliceBorderColor, "#FFFFFF"),
+                        SliceBorderWidth: Max(0, Min(8, Coalesce(style.SliceBorderWidth, 2)))
+                    }
+                )
+            )
+        )
+    )
+)
+
+
+06 — cmpSvgPie.SvgMarkup
+
+Output · Text
+
+
+With(
+    {
+        data: Sort(cmpSvgPie.ChartSlices, SliceNo, SortOrder.Ascending),
+        layout: cmpSvgPie.ChartLayout,
+        numberFormat: "[$-en-US]0.#########"
+    },
+    With(
+        {
+            shapes: ForAll(
+                data As slice,
+                {
+                    SliceNo: slice.SliceNo,
+                    SliceColor: slice.SliceColor,
+                    Shape: If(
+                        CountRows(data) = 1,
+                        "<circle cx='" & Text(layout.CenterX, numberFormat, "en-US") &
+                        "' cy='" & Text(layout.CenterY, numberFormat, "en-US") &
+                        "' r='" & Text(layout.Radius, numberFormat, "en-US") & "'/>",
+                        "<path d='M " & Text(layout.CenterX, numberFormat, "en-US") & " " & Text(layout.CenterY, numberFormat, "en-US") &
+                        " L " & Text(layout.CenterX + layout.Radius * Cos(slice.AngleStart), numberFormat, "en-US") & " " & Text(layout.CenterY + layout.Radius * Sin(slice.AngleStart), numberFormat, "en-US") &
+                        " A " & Text(layout.Radius, numberFormat, "en-US") & " " & Text(layout.Radius, numberFormat, "en-US") & " 0 0 1 " & Text(layout.CenterX + layout.Radius * slice.UnitX, numberFormat, "en-US") & " " & Text(layout.CenterY + layout.Radius * slice.UnitY, numberFormat, "en-US") &
+                        " A " & Text(layout.Radius, numberFormat, "en-US") & " " & Text(layout.Radius, numberFormat, "en-US") & " 0 0 1 " & Text(layout.CenterX + layout.Radius * Cos(slice.AngleEnd), numberFormat, "en-US") & " " & Text(layout.CenterY + layout.Radius * Sin(slice.AngleEnd), numberFormat, "en-US") &
+                        " Z'/>"
+                    )
+                }
+            ),
+            titleCaption: If(
+                Len(cmpSvgPie.ChartTitle) > layout.TitleMaxCharacters,
+                Left(cmpSvgPie.ChartTitle, layout.TitleMaxCharacters - 1) & "…",
+                cmpSvgPie.ChartTitle
+            )
+        },
+        "<svg xmlns='http://www.w3.org/2000/svg' width='" & Text(layout.Width, numberFormat, "en-US") &
+        "' height='" & Text(layout.Height, numberFormat, "en-US") &
+        "' viewBox='0 0 " & Text(layout.Width, numberFormat, "en-US") & " " & Text(layout.Height, numberFormat, "en-US") &
+        "' font-family='Segoe UI, Arial, sans-serif'>" &
+        "<title>" & Substitute(Substitute(Substitute(cmpSvgPie.ChartTitle, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</title>" &
+        "<rect width='100%' height='100%' fill='" & layout.BackgroundColor & "'/>" &
+        If(
+            !IsBlank(Trim(cmpSvgPie.ChartTitle)),
+            "<text x='" & Text(layout.CenterX, numberFormat, "en-US") &
+            "' y='" & Text(layout.Padding + layout.TitleFontSize / 2, numberFormat, "en-US") &
+            "' text-anchor='middle' dominant-baseline='central' font-size='" & Text(layout.TitleFontSize, numberFormat, "en-US") &
+            "' font-weight='600' fill='" & layout.TextColor & "'>" &
+            Substitute(Substitute(Substitute(titleCaption, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</text>",
+            ""
+        ) &
+        If(
+            !IsBlank(cmpSvgPie.DataMessage),
+            "<text x='" & Text(layout.CenterX, numberFormat, "en-US") &
+            "' y='" & Text(layout.CenterY, numberFormat, "en-US") &
+            "' text-anchor='middle' dominant-baseline='central' font-size='14' fill='" & layout.TextColor & "'>" &
+            Substitute(Substitute(Substitute(cmpSvgPie.DataMessage, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</text>",
+            "<defs>" &
+            Concat(
+                shapes As shape,
+                "<clipPath id='pieClip" & Text(shape.SliceNo, "0", "en-US") & "' clipPathUnits='userSpaceOnUse'>" & shape.Shape & "</clipPath>",
+                ""
+            ) &
+            "</defs>" &
+            Concat(
+                shapes As shape,
+                "<g fill='" & shape.SliceColor & "' stroke='" & layout.SliceBorderColor &
+                "' stroke-width='" & Text(layout.SliceBorderWidth, numberFormat, "en-US") &
+                "' stroke-linejoin='round'>" & shape.Shape & "</g>",
+                ""
+            ) &
+            Concat(
+                Filter(data As candidate, candidate.Fraction * 100 >= layout.MinInsidePercent && CountRows(candidate.InsideLines) > 0) As slice,
+                With(
+                    {
+                        labelX: If(CountRows(data) = 1, layout.CenterX, layout.CenterX + layout.Radius * layout.InsideRadius * slice.UnitX),
+                        labelY: If(CountRows(data) = 1, layout.CenterY, layout.CenterY + layout.Radius * layout.InsideRadius * slice.UnitY),
+                        lineCount: CountRows(slice.InsideLines),
+                        maxCharacters: Min(layout.InsideMaxCharacters, Max(slice.InsideLines As line, Len(line.Caption))),
+                        safeRadius: If(
+                            CountRows(data) = 1,
+                            layout.Radius,
+                            Min(
+                                layout.Radius * (1 - layout.InsideRadius),
+                                layout.Radius * layout.InsideRadius * If(slice.Fraction >= 0.5, 1, Sin(Pi() * slice.Fraction))
+                            )
+                        )
+                    },
+                    With(
+                        { insideFont: Min(layout.LabelFontSize, 2 * safeRadius / Sqrt((maxCharacters * 0.65) ^ 2 + (lineCount * 1.3) ^ 2)) },
+                    If(
+                        insideFont < 8,
+                        "",
+                        "<g clip-path='url(#pieClip" & Text(slice.SliceNo, "0", "en-US") & ")'>" &
+                    Concat(
+                        Sequence(CountRows(slice.InsideLines)) As counter,
+                        With(
+                            { line: Index(slice.InsideLines, counter.Value) },
+                            With(
+                                {
+                                    caption: If(
+                                        Len(line.Caption) > layout.InsideMaxCharacters,
+                                        Left(line.Caption, layout.InsideMaxCharacters - 1) & "…",
+                                        line.Caption
+                                    )
+                                },
+                                "<text x='" & Text(labelX, numberFormat, "en-US") &
+                                "' y='" & Text(labelY + (counter.Value - (lineCount + 1) / 2) * insideFont * 1.3, numberFormat, "en-US") &
+                                "' text-anchor='middle' dominant-baseline='central' font-size='" & Text(insideFont, numberFormat, "en-US") &
+                                "' font-weight='" & If(line.LineNo = 1, "600", "500") & "' fill='" & slice.InsideTextColor & "'>" &
+                                Substitute(Substitute(Substitute(caption, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</text>"
+                            )
+                        ),
+                        ""
+                    ) & "</g>"
+                    )
+                    )
+                ),
+                ""
+            ) &
+            Concat(
+                Filter(data As candidate, CountRows(candidate.OutsideLines) > 0) As slice,
+                With(
+                    {
+                        rankBefore: CountIf(
+                            data As other,
+                            CountRows(other.OutsideLines) > 0 && other.Side = slice.Side &&
+                            (other.UnitY < slice.UnitY || (other.UnitY = slice.UnitY && other.SliceNo < slice.SliceNo))
+                        ),
+                        sideCount: If(slice.Side = 1, layout.RightCount, layout.LeftCount),
+                        labelX: If(slice.Side = 1, layout.RightLabelX, layout.LeftLabelX),
+                        sameSide: Filter(data As other, CountRows(other.OutsideLines) > 0 && other.Side = slice.Side)
+                    },
+                    With(
+                        {
+                            labelY: Max(
+                                Filter(
+                                    sameSide As prior,
+                                    prior.UnitY < slice.UnitY || (prior.UnitY = slice.UnitY && prior.SliceNo <= slice.SliceNo)
+                                ) As prior,
+                                With(
+                                    {
+                                        priorRank: CountIf(
+                                            sameSide As other,
+                                            other.UnitY < prior.UnitY || (other.UnitY = prior.UnitY && other.SliceNo < prior.SliceNo)
+                                        )
+                                    },
+                                    Min(
+                                        layout.OutsideBottom - (sideCount - 1 - priorRank) * layout.OutsideRowHeight,
+                                        Max(
+                                            layout.OutsideTop + priorRank * layout.OutsideRowHeight,
+                                            layout.CenterY + (layout.Radius + 8) * prior.UnitY
+                                        )
+                                    ) + (rankBefore - priorRank) * layout.OutsideRowHeight
+                                )
+                            )
+                        },
+                        "<path d='M " & Text(layout.CenterX + layout.Radius * slice.UnitX, numberFormat, "en-US") & " " & Text(layout.CenterY + layout.Radius * slice.UnitY, numberFormat, "en-US") &
+                        " L " & Text(layout.CenterX + (layout.Radius + 8) * slice.UnitX, numberFormat, "en-US") & " " & Text(layout.CenterY + (layout.Radius + 8) * slice.UnitY, numberFormat, "en-US") &
+                        " L " & Text(layout.CenterX + slice.Side * (layout.Radius + 16), numberFormat, "en-US") & " " & Text(layout.CenterY + (layout.Radius + 8) * slice.UnitY, numberFormat, "en-US") &
+                        " L " & Text(labelX - slice.Side * 8, numberFormat, "en-US") & " " & Text(labelY, numberFormat, "en-US") &
+                        "' fill='none' stroke='" & layout.LeaderLineColor & "' stroke-width='1.25'/>" &
+                        Concat(
+                            Sequence(CountRows(slice.OutsideLines)) As counter,
+                            With(
+                                { line: Index(slice.OutsideLines, counter.Value) },
+                                With(
+                                    {
+                                        caption: If(
+                                            Len(line.Caption) > layout.OutsideMaxCharacters,
+                                            Left(line.Caption, layout.OutsideMaxCharacters - 1) & "…",
+                                            line.Caption
+                                        )
+                                    },
+                                    "<text x='" & Text(labelX, numberFormat, "en-US") &
+                                    "' y='" & Text(labelY + (counter.Value - (CountRows(slice.OutsideLines) + 1) / 2) * layout.LineHeight, numberFormat, "en-US") &
+                                    "' text-anchor='" & If(slice.Side = 1, "start", "end") &
+                                    "' dominant-baseline='central' font-size='" & Text(layout.LabelFontSize, numberFormat, "en-US") &
+                                    "' font-weight='" & If(line.LineNo = 1, "600", "500") & "' fill='" & layout.TextColor & "'>" &
+                                    Substitute(Substitute(Substitute(caption, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</text>"
+                                )
+                            ),
+                            ""
+                        )
+                    )
+                ),
+                ""
+            ) &
+            If(
+                cmpSvgPie.ShowLegend,
+                Concat(
+                    data As slice,
+                    With(
+                        {
+                            cellX: layout.Padding + Mod(slice.SliceNo - 1, layout.LegendColumns) * layout.LegendCellWidth,
+                            cellY: layout.LegendTop + RoundDown((slice.SliceNo - 1) / layout.LegendColumns, 0) * layout.LegendRowHeight,
+                            caption: If(
+                                Len(slice.LegendText) > layout.LegendMaxCharacters,
+                                Left(slice.LegendText, layout.LegendMaxCharacters - 1) & "…",
+                                slice.LegendText
+                            )
+                        },
+                        "<circle cx='" & Text(cellX + 6, numberFormat, "en-US") & "' cy='" & Text(cellY, numberFormat, "en-US") & "' r='5' fill='" & slice.SliceColor & "'/>" &
+                        "<text x='" & Text(cellX + 20, numberFormat, "en-US") & "' y='" & Text(cellY, numberFormat, "en-US") &
+                        "' dominant-baseline='central' font-size='" & Text(layout.LegendFontSize, numberFormat, "en-US") & "' fill='" & layout.TextColor & "'>" &
+                        Substitute(Substitute(Substitute(caption, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") & "</text>"
+                    ),
+                    ""
+                ),
+                ""
+            )
+        ) &
+        "</svg>"
+    )
+)
+
+
+07 — cmpSvgPie.SvgImage
+
+Output · Text
+
+
+"data:image/svg+xml;utf8," & EncodeUrl(cmpSvgPie.SvgMarkup)
+
+
+08 — cmpSvgPie.RecommendedHeight
+
+Output · Number
+
+
+cmpSvgPie.ChartLayout.Height * cmpSvgPie.Width / cmpSvgPie.ChartLayout.Width
+
+
+09 — imgPie.AccessibleLabel
+
+Standard Image property · Text
+
+
+If(
+    !IsBlank(cmpSvgPie.DataMessage),
+    cmpSvgPie.ChartTitle & ". " & cmpSvgPie.DataMessage,
+    cmpSvgPie.ChartTitle & ". " &
+    Concat(
+        cmpSvgPie.ChartSlices As slice,
+        slice.LegendText & ": " &
+        Text(slice.Amount, "[$-en-US]#,##0.##", "en-US") &
+        " (" & Text(slice.Fraction * 100, "[$-en-US]0.00", "en-US") & "%). ",
+        ""
+    )
+)
+
+
+10 — cmpSvgPie_1.Items
+
+Optional source mapping on a screen instance · Table
+
+
+// Example source schema: Category (Text), Total (Number).
+// Replace SummaryTable, Category and Total with your actual names.
+With(
+    { summary: SummaryTable },
+    With(
+        { grandTotal: Sum(Filter(summary As item, item.Total > 0) As item, item.Total) },
+        ForAll(
+            summary As item,
+            {
+                Amount: item.Total,
+                Label1: item.Category,
+                Label2: Text(item.Total / 1000000, "[$-en-US]0.00", "en-US") & "M",
+                Label3: If(
+                    grandTotal > 0,
+                    Text(item.Total / grandTotal * 100, "[$-en-US]0.00", "en-US") & "%",
+                    ""
+                ),
+                LegendText: item.Category,
+                SliceColor: "",
+                InsideTextColor: "#FFFFFF"
+            }
+        )
+    )
+)
+
+
+Reference documentation
+
+- Microsoft: Canvas component overview (https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/create-component)
+- Microsoft: Canvas component properties (https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/component-properties)
+- Microsoft: Map component input fields (https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/map-component-input-fields)
+- Microsoft: Image control (https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/controls/control-image)
+- Microsoft: EncodeUrl (https://learn.microsoft.com/en-us/power-platform/power-fx/reference/function-encode-decode)
+- Microsoft: Text and locale formatting (https://learn.microsoft.com/en-us/power-platform/power-fx/reference/function-text)
+- Microsoft: With (https://learn.microsoft.com/en-us/power-platform/power-fx/reference/function-with)
+- Microsoft: ForAll and record scope (https://learn.microsoft.com/en-us/power-platform/power-fx/reference/function-forall)
+- Microsoft: Trigonometric functions (https://learn.microsoft.com/en-us/power-platform/power-fx/reference/function-trig)
+- Microsoft: Delegation overview (https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/delegation-overview)
+- MDN: SVG used as an image (https://developer.mozilla.org/en-US/docs/Web/SVG/Guides/SVG_as_an_image)
+
+The implementation in this package is custom; the references document the platform capabilities and functions it uses.
