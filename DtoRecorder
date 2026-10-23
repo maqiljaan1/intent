@@ -1,0 +1,1308 @@
+#requires -Version 5.1
+<#
+DTORadar Recorder 1.0
+All application code, GUI, worker, validation and tests are PowerShell.
+Uses only Windows/.NET libraries. No embedded C#, modules or downloads.
+Record means: pick a UIA control, perform an action, append it after success.
+It does not passively intercept mouse clicks or keyboard input.
+#>
+[CmdletBinding()]
+param(
+    [string]$Open,
+    [string]$Play,
+    [string]$VariablesFile,
+    [string]$ResultPath,
+    [switch]$DryRun,
+    [switch]$SelfTest,
+    [switch]$Demo,
+    [switch]$Worker,
+    [string]$RequestPath,
+    [string]$ResponsePath
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$script:EntryPath = $PSCommandPath
+$script:Actions = @('Invoke','SetValue','SetRange','Toggle','Select','AddToSelection',
+    'RemoveFromSelection','Expand','Collapse','Focus','Scroll','SetScrollPercent',
+    'ScrollIntoView','WaitFor','AssertProperty','Delay')
+$script:Properties = @('Name','AutomationId','ClassName','ControlType','IsEnabled',
+    'IsOffscreen','HasKeyboardFocus','Value','ToggleState','IsSelected',
+    'ExpandCollapseState','RangeValue')
+
+function Assert-That($Condition, [string]$Message) {
+    if (-not $Condition) { throw $Message }
+}
+function Test-Field($Object, [string]$Name) {
+    return ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name])
+}
+function Assert-Object($Object, [string]$Name) {
+    Assert-That ($null -ne $Object -and $Object -is [pscustomobject]) "$Name must be a JSON object."
+}
+function Assert-Fields($Object, [string[]]$Required, [string[]]$Allowed, [string]$Name) {
+    Assert-Object $Object $Name
+    foreach ($key in $Required) { Assert-That (Test-Field $Object $key) "$Name is missing '$key'." }
+    foreach ($prop in $Object.PSObject.Properties) {
+        Assert-That ($Allowed -ccontains $prop.Name) "$Name contains unknown field '$($prop.Name)'."
+    }
+}
+function Assert-String($Value, [string]$Name, [int]$Maximum = 65536) {
+    Assert-That ($Value -is [string] -and $Value.Length -le $Maximum) "$Name must be a string of at most $Maximum characters."
+}
+function Assert-Integer($Value, [long]$Minimum, [long]$Maximum, [string]$Name) {
+    Assert-That (($Value -is [int] -or $Value -is [long]) -and
+        $Value -ge $Minimum -and $Value -le $Maximum) "$Name must be an integer from $Minimum to $Maximum."
+}
+function Test-Template([string]$Value) { return ($Value -match '\$\{[A-Za-z_][A-Za-z0-9_]*\}') }
+function Assert-Number($Value, [double]$Minimum, [double]$Maximum, [string]$Name) {
+    if ($Value -is [string] -and (Test-Template $Value)) { return }
+    $number = 0.0
+    $parsed = [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float,
+        [Globalization.CultureInfo]::InvariantCulture, [ref]$number)
+    Assert-That ($parsed -and -not [double]::IsNaN($number) -and
+        -not [double]::IsInfinity($number) -and $number -ge $Minimum -and $number -le $Maximum) "$Name is outside its numeric range."
+}
+function Convert-Number($Value) {
+    return [double]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture)
+}
+function Copy-Data($Value) { return ($Value | ConvertTo-Json -Depth 80 -Compress | ConvertFrom-Json) }
+function Read-Json([string]$Path) {
+    $file = Get-Item -LiteralPath $Path
+    Assert-That (-not $file.PSIsContainer -and $file.Length -le 10485760) 'JSON files must be no larger than 10 MiB.'
+    return ([IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json)
+}
+function Write-Json([string]$Path, $Value) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetDirectoryName($full)
+    [void][IO.Directory]::CreateDirectory($parent)
+    $temp = Join-Path $parent ('.' + [IO.Path]::GetFileName($full) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temp, ($Value | ConvertTo-Json -Depth 80), (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($full)) {
+            # Atomic replacement: an interrupted save leaves the previous file intact.
+            [IO.File]::Replace($temp, $full, [System.Management.Automation.Language.NullString]::Value)
+        } else { [IO.File]::Move($temp, $full) }
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+function New-Recording {
+    return [pscustomobject][ordered]@{
+        format = 'DTORadar.Recording'; schemaVersion = 1; name = 'Untitled recording'
+        description = ''; variables = [pscustomobject]@{}
+        settings = [pscustomobject]@{ intervalMs = 250 }
+        steps = @()
+    }
+}
+function New-Step([string]$Action, $Target = $null, $Arguments = $null) {
+    if ($null -eq $Arguments) { $Arguments = [pscustomobject]@{} }
+    return [pscustomobject][ordered]@{
+        id = [guid]::NewGuid().ToString(); label = $Action; enabled = $true
+        action = $Action; target = $Target; arguments = $Arguments
+        timeoutMs = 10000; onError = 'Stop'
+    }
+}
+function Assert-Target($Target) {
+    Assert-Fields $Target @('window','path') @('window','path') 'target'
+    $w = $Target.window
+    Assert-Fields $w @('processName','className','title','titleMatch') @('processName','className','title','titleMatch') 'target.window'
+    foreach ($key in @('processName','className','title')) { Assert-String $w.$key "window.$key" 1024 }
+    Assert-That ($w.processName.Length -gt 0) 'window.processName cannot be empty.'
+    Assert-That (@('Exact','Ignore') -ccontains $w.titleMatch) 'titleMatch must be Exact or Ignore.'
+    Assert-That ($Target.path -is [array] -and $Target.path.Count -le 64) 'target.path must be an array with at most 64 segments.'
+    foreach ($seg in $Target.path) {
+        $fields = @('automationId','name','className','controlType','useName','index','matchCount')
+        Assert-Fields $seg $fields $fields 'path segment'
+        foreach ($key in @('automationId','name','className')) { Assert-String $seg.$key "segment.$key" 4096 }
+        Assert-Integer $seg.controlType 50000 50100 'controlType'
+        Assert-That ($seg.useName -is [bool]) 'useName must be true or false.'
+        Assert-Integer $seg.matchCount 1 5000 'matchCount'
+        Assert-Integer $seg.index 0 ($seg.matchCount - 1) 'index'
+    }
+}
+function Assert-Step($Step) {
+    $fields = @('id','label','enabled','action','target','arguments','timeoutMs','onError')
+    Assert-Fields $Step $fields $fields 'step'
+    Assert-String $Step.id 'id' 80
+    Assert-That ($Step.id.Length -gt 0) 'Step id cannot be empty.'
+    Assert-String $Step.label 'label' 256
+    Assert-That ($Step.enabled -is [bool]) 'enabled must be true or false.'
+    Assert-That ($script:Actions -ccontains $Step.action) 'Unknown step action.'
+    Assert-Integer $Step.timeoutMs 100 300000 'timeoutMs'
+    Assert-That (@('Stop','Continue') -ccontains $Step.onError) 'onError must be Stop or Continue.'
+    if ($Step.action -eq 'Delay') { Assert-That ($null -eq $Step.target) 'Delay must have a null target.' }
+    else { Assert-Target $Step.target }
+    $a = $Step.arguments
+    switch -CaseSensitive ($Step.action) {
+        'SetValue' { Assert-Fields $a @('value') @('value') 'arguments'; Assert-String $a.value 'value' }
+        'SetRange' { Assert-Fields $a @('value') @('value') 'arguments'; Assert-Number $a.value ([double]::MinValue) ([double]::MaxValue) 'value' }
+        'Delay' { Assert-Fields $a @('milliseconds') @('milliseconds') 'arguments'; Assert-Integer $a.milliseconds 0 300000 'milliseconds' }
+        'Scroll' {
+            Assert-Fields $a @('horizontal','vertical') @('horizontal','vertical') 'arguments'
+            $amounts = @('NoAmount','SmallIncrement','LargeIncrement','SmallDecrement','LargeDecrement')
+            Assert-That (($amounts -ccontains $a.horizontal) -and ($amounts -ccontains $a.vertical)) 'Invalid Scroll amount.'
+        }
+        'SetScrollPercent' {
+            Assert-Fields $a @('horizontal','vertical') @('horizontal','vertical') 'arguments'
+            foreach ($key in @('horizontal','vertical')) {
+                Assert-Number $a.$key -1 100 $key
+                if (-not (Test-Template ([string]$a.$key))) {
+                    $n = Convert-Number $a.$key
+                    Assert-That ($n -eq -1 -or $n -ge 0) 'Scroll percent must be -1 or 0 through 100.'
+                }
+            }
+        }
+        'AssertProperty' {
+            Assert-Fields $a @('property','operator','expected') @('property','operator','expected') 'arguments'
+            Assert-That ($script:Properties -ccontains $a.property) 'Unsupported assertion property.'
+            Assert-That (@('Equals','Contains','NotEquals') -ccontains $a.operator) 'Invalid assertion operator.'
+            Assert-String $a.expected 'expected'
+        }
+        default { Assert-Fields $a @() @() 'arguments' }
+    }
+}
+function Assert-Variables($Variables) {
+    Assert-Object $Variables 'variables'
+    foreach ($p in $Variables.PSObject.Properties) {
+        Assert-That ($p.Name -cmatch '^[A-Za-z_][A-Za-z0-9_]*$') 'Variable names must be letters, digits and underscores; start with a letter or underscore.'
+        Assert-String $p.Value 'variable value'
+    }
+}
+function Assert-Recording($Document) {
+    $fields = @('format','schemaVersion','name','description','variables','settings','steps')
+    Assert-Fields $Document $fields $fields 'recording'
+    Assert-That ($Document.format -ceq 'DTORadar.Recording') 'This is not a DTORadar .psrec recording.'
+    Assert-Integer $Document.schemaVersion 1 1 'schemaVersion'
+    Assert-String $Document.name 'name' 256
+    Assert-String $Document.description 'description'
+    Assert-Variables $Document.variables
+    Assert-Fields $Document.settings @('intervalMs') @('intervalMs') 'settings'
+    Assert-Integer $Document.settings.intervalMs 0 60000 'intervalMs'
+    Assert-That ($Document.steps -is [array] -and $Document.steps.Count -le 10000) 'steps must be an array with at most 10000 entries.'
+    $ids = @{}
+    foreach ($step in $Document.steps) {
+        Assert-Step $step
+        Assert-That (-not $ids.ContainsKey($step.id)) 'Duplicate step id.'
+        $ids[$step.id] = $true
+    }
+}
+function Get-Variables($Document, [string]$OverrideFile) {
+    $values = @{}
+    foreach ($p in $Document.variables.PSObject.Properties) { $values[$p.Name] = $p.Value }
+    if ($OverrideFile) {
+        $overrides = Read-Json $OverrideFile
+        Assert-Variables $overrides
+        foreach ($p in $overrides.PSObject.Properties) { $values[$p.Name] = $p.Value }
+    }
+    return $values
+}
+function Expand-Data($Value, [hashtable]$Values) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) {
+        $evaluator = [Text.RegularExpressions.MatchEvaluator]{
+            param($match)
+            $key = $match.Groups[1].Value
+            if (-not $Values.ContainsKey($key)) { throw "Variable '$key' is not defined." }
+            return [string]$Values[$key]
+        }.GetNewClosure()
+        return [regex]::Replace($Value, '\$\{([A-Za-z_][A-Za-z0-9_]*)\}', $evaluator)
+    }
+    if ($Value -is [array]) {
+        $items = @(); foreach ($item in $Value) { $items += ,(Expand-Data $item $Values) }
+        return ,$items
+    }
+    if ($Value -is [pscustomobject]) {
+        $obj = [ordered]@{}
+        foreach ($p in $Value.PSObject.Properties) { $obj[$p.Name] = Expand-Data $p.Value $Values }
+        return [pscustomobject]$obj
+    }
+    return $Value
+}
+function Resolve-StepData($Step, [hashtable]$Values) {
+    # Never expand identity, action or control-flow fields. Variables are literal data.
+    $copy = Copy-Data $Step
+    $copy.target = Expand-Data $Step.target $Values
+    $copy.arguments = Expand-Data $Step.arguments $Values
+    Assert-Step $copy
+    # After expansion, numeric values must actually parse, even if the replacement
+    # text itself contains a literal ${...} sequence (substitution is one pass).
+    if ($copy.action -eq 'SetRange') { [void](Convert-Number $copy.arguments.value) }
+    if ($copy.action -eq 'SetScrollPercent') {
+        [void](Convert-Number $copy.arguments.horizontal)
+        [void](Convert-Number $copy.arguments.vertical)
+    }
+    return $copy
+}
+
+# UIA is loaded only in the separate MTA worker process, never on the GUI thread.
+function Initialize-Uia {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    Add-Type -AssemblyName WindowsBase
+    Add-Type -AssemblyName System.Windows.Forms
+}
+function Test-Segment($Element, $Segment) {
+    $c = $Element.Current
+    if ($c.ControlType.Id -ne $Segment.controlType) { return $false }
+    if ($Segment.automationId -and $c.AutomationId -cne $Segment.automationId) { return $false }
+    if ($Segment.className -and $c.ClassName -cne $Segment.className) { return $false }
+    if ($Segment.useName -and $c.Name -cne $Segment.name) { return $false }
+    return $true
+}
+function Get-ControlChildren($Parent) {
+    $items = New-Object Collections.Generic.List[object]
+    $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+    $child = $walker.GetFirstChild($Parent)
+    while ($null -ne $child) {
+        if ($items.Count -ge 5000) { throw 'A control has more than 5000 children; use a narrower target.' }
+        $items.Add($child)
+        $child = $walker.GetNextSibling($child)
+    }
+    return ,($items.ToArray())
+}
+function Get-ElementKey($Element) { return ($Element.GetRuntimeId() -join ':') }
+function Get-Locator($Element, [int]$OwnerProcessId) {
+    $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+    $element = $walker.Normalize($Element)
+    Assert-That ($null -ne $element) 'No control was found.'
+    $desktop = [Windows.Automation.AutomationElement]::RootElement
+    $desktopKey = Get-ElementKey $desktop
+    $segments = New-Object Collections.Generic.List[object]
+    $node = $element
+    for ($depth = 0; $depth -le 64; $depth++) {
+        $parent = $walker.GetParent($node)
+        Assert-That ($null -ne $parent) 'Pick a control in an application window, not the desktop.'
+        if ((Get-ElementKey $parent) -eq $desktopKey) { break }
+        Assert-That ($depth -lt 64) 'Control path exceeds 64 levels.'
+        $c = $node.Current
+        $segment = [pscustomobject][ordered]@{
+            automationId = [string]$c.AutomationId; name = [string]$c.Name
+            className = [string]$c.ClassName; controlType = [int]$c.ControlType.Id
+            useName = [bool]([string]::IsNullOrEmpty($c.AutomationId) -and
+                $c.ControlType.Id -ne 50004 -and $c.ControlType.Id -ne 50030)
+            index = 0; matchCount = 1
+        }
+        # Edit/Document names can contain current text. Never store their contents as locators.
+        if ($c.ControlType.Id -eq 50004 -or $c.ControlType.Id -eq 50030 -or $c.IsPassword) {
+            $segment.name = ''; $segment.useName = $false
+        }
+        $candidateMatches = @(Get-ControlChildren $parent | ForEach-Object { $_ } | Where-Object { Test-Segment $_ $segment })
+        $key = Get-ElementKey $node
+        $found = -1
+        for ($i = 0; $i -lt $candidateMatches.Count; $i++) { if ((Get-ElementKey $candidateMatches[$i]) -eq $key) { $found = $i; break } }
+        Assert-That ($found -ge 0) 'The control tree changed while picking. Pick it again.'
+        $segment.index = $found; $segment.matchCount = $candidateMatches.Count
+        $segments.Insert(0, $segment)
+        $node = $parent
+    }
+    $w = $node.Current
+    Assert-That ($w.ProcessId -ne $OwnerProcessId -and $w.ProcessId -ne $PID) 'Pick a control outside the recorder.'
+    Assert-That (@('Progman','WorkerW') -notcontains $w.ClassName) 'The desktop is not a supported target.'
+    $processName = (Get-Process -Id $w.ProcessId).ProcessName
+    return [pscustomobject][ordered]@{
+        window = [pscustomobject][ordered]@{
+            processName = $processName; className = [string]$w.ClassName
+            title = [string]$w.Name; titleMatch = 'Exact'
+        }
+        path = @($segments.ToArray())
+    }
+}
+function Find-Target($Target) {
+    $windows = New-Object Collections.Generic.List[object]
+    $w = $Target.window
+    $desktop = [Windows.Automation.AutomationElement]::RootElement
+    foreach ($candidate in (Get-ControlChildren $desktop)) {
+        try {
+            $c = $candidate.Current
+            if ($w.className -and $c.ClassName -cne $w.className) { continue }
+            if ($w.titleMatch -eq 'Exact' -and $c.Name -cne $w.title) { continue }
+            if ((Get-Process -Id $c.ProcessId -ErrorAction Stop).ProcessName -ine $w.processName) { continue }
+            $windows.Add($candidate)
+        } catch { continue }
+    }
+    if ($windows.Count -gt 1) { throw 'Ambiguous window: use an exact title or close duplicate windows.' }
+    if ($windows.Count -eq 0) { throw 'Target window is not available.' }
+    $node = $windows[0]
+    foreach ($seg in $Target.path) {
+        $candidateMatches = @(Get-ControlChildren $node | ForEach-Object { $_ } | Where-Object { Test-Segment $_ $seg })
+        if ($candidateMatches.Count -ne $seg.matchCount) { throw 'Control path changed or is unavailable; recapture the target.' }
+        $node = $candidateMatches[$seg.index]
+    }
+    return $node
+}
+function Get-Pattern($Element, [string]$Name) {
+    $type = [type]("System.Windows.Automation.${Name}Pattern, UIAutomationClient")
+    $patternId = $type.GetField('Pattern').GetValue($null)
+    $pattern = $null
+    if (-not $Element.TryGetCurrentPattern($patternId, [ref]$pattern)) { throw "This control does not expose the $Name pattern." }
+    return $pattern
+}
+function Get-UiaProperty($Element, [string]$Property) {
+    $c = $Element.Current
+    switch -CaseSensitive ($Property) {
+        'Value' {
+            if ($c.IsPassword) { throw 'Password values cannot be read or asserted.' }
+            return [string](Get-Pattern $Element 'Value').Current.Value
+        }
+        'ToggleState' { return [string](Get-Pattern $Element 'Toggle').Current.ToggleState }
+        'IsSelected' { return [string](Get-Pattern $Element 'SelectionItem').Current.IsSelected }
+        'ExpandCollapseState' { return [string](Get-Pattern $Element 'ExpandCollapse').Current.ExpandCollapseState }
+        'RangeValue' { return (Get-Pattern $Element 'RangeValue').Current.Value.ToString([Globalization.CultureInfo]::InvariantCulture) }
+        'ControlType' { return [string]$c.ControlType.ProgrammaticName }
+        default { return [string]$c.$Property }
+    }
+}
+function Test-Assertion([string]$Actual, $Arguments) {
+    switch -CaseSensitive ($Arguments.operator) {
+        'Equals' { return [string]::Equals($Actual, $Arguments.expected, [StringComparison]::Ordinal) }
+        'NotEquals' { return -not [string]::Equals($Actual, $Arguments.expected, [StringComparison]::Ordinal) }
+        'Contains' { return $Actual.IndexOf($Arguments.expected, [StringComparison]::Ordinal) -ge 0 }
+    }
+    return $false
+}
+function Get-RequiredPattern([string]$Action) {
+    switch ($Action) {
+        'Invoke' { 'Invoke' }; 'SetValue' { 'Value' }; 'SetRange' { 'RangeValue' }
+        'Toggle' { 'Toggle' }; 'Select' { 'SelectionItem' }; 'AddToSelection' { 'SelectionItem' }
+        'RemoveFromSelection' { 'SelectionItem' }; 'Expand' { 'ExpandCollapse' }; 'Collapse' { 'ExpandCollapse' }
+        'Scroll' { 'Scroll' }; 'SetScrollPercent' { 'Scroll' }; 'ScrollIntoView' { 'ScrollItem' }
+        default { '' }
+    }
+}
+function Assert-ActionReady($Element, $Step) {
+    $patternName = Get-RequiredPattern $Step.action
+    if ($patternName) {
+        $p = Get-Pattern $Element $patternName
+        if ($Step.action -eq 'SetValue' -or $Step.action -eq 'SetRange') {
+            Assert-That (-not $p.Current.IsReadOnly) 'The target is read-only.'
+        }
+        if ($Step.action -eq 'SetRange') {
+            $n = Convert-Number $Step.arguments.value
+            Assert-That ($n -ge $p.Current.Minimum -and $n -le $p.Current.Maximum) 'The value is outside the control range.'
+        }
+    }
+    if (@('WaitFor','AssertProperty') -notcontains $Step.action) {
+        Assert-That $Element.Current.IsEnabled 'The target is disabled.'
+    }
+}
+function Invoke-UiaStep($Step, [bool]$ValidateOnly) {
+    Assert-Step $Step
+    if ($Step.action -eq 'Delay') {
+        if (-not $ValidateOnly) { Start-Sleep -Milliseconds $Step.arguments.milliseconds }
+        return
+    }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = 'Target is not ready.'
+    do {
+        try {
+            $element = Find-Target $Step.target
+            Assert-ActionReady $element $Step
+            if ($Step.action -eq 'AssertProperty') {
+                $actual = Get-UiaProperty $element $Step.arguments.property
+                if (-not (Test-Assertion $actual $Step.arguments)) { throw 'Assertion did not match.' }
+            }
+            $ready = $true
+        } catch { $ready = $false; $lastError = $_.Exception.Message }
+        if ($ready) { break }
+        if ($clock.ElapsedMilliseconds -ge $Step.timeoutMs) { throw "Target wait timed out. $lastError" }
+        Start-Sleep -Milliseconds 150
+    } while ($true)
+    if ($ValidateOnly) { return }
+    $a = $Step.arguments
+    # Deliberately outside the retry loop: a mutating action is never automatically replayed.
+    switch -CaseSensitive ($Step.action) {
+        'Invoke' { (Get-Pattern $element 'Invoke').Invoke() }
+        'SetValue' { (Get-Pattern $element 'Value').SetValue([string]$a.value) }
+        'SetRange' { (Get-Pattern $element 'RangeValue').SetValue((Convert-Number $a.value)) }
+        'Toggle' { (Get-Pattern $element 'Toggle').Toggle() }
+        'Select' { (Get-Pattern $element 'SelectionItem').Select() }
+        'AddToSelection' { (Get-Pattern $element 'SelectionItem').AddToSelection() }
+        'RemoveFromSelection' { (Get-Pattern $element 'SelectionItem').RemoveFromSelection() }
+        'Expand' { (Get-Pattern $element 'ExpandCollapse').Expand() }
+        'Collapse' { (Get-Pattern $element 'ExpandCollapse').Collapse() }
+        'Focus' { $element.SetFocus() }
+        'Scroll' { (Get-Pattern $element 'Scroll').Scroll([Windows.Automation.ScrollAmount]$a.horizontal, [Windows.Automation.ScrollAmount]$a.vertical) }
+        'SetScrollPercent' { (Get-Pattern $element 'Scroll').SetScrollPercent((Convert-Number $a.horizontal),(Convert-Number $a.vertical)) }
+        'ScrollIntoView' { (Get-Pattern $element 'ScrollItem').ScrollIntoView() }
+        'WaitFor' { }
+        'AssertProperty' { }
+    }
+}
+function Invoke-Worker {
+    $outcome = [pscustomobject]@{ ok = $false; message = ''; data = $null; elapsedMs = 0 }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        Initialize-Uia
+        $request = Read-Json $RequestPath
+        switch -CaseSensitive ($request.kind) {
+            'Pick' {
+                $point = New-Object Windows.Point([double]$request.x, [double]$request.y)
+                $element = [Windows.Automation.AutomationElement]::FromPoint($point)
+                $element = [Windows.Automation.TreeWalker]::ControlViewWalker.Normalize($element)
+                $target = Get-Locator $element $request.ownerProcessId
+                Assert-Target $target
+                $c = $element.Current
+                $name = [string]$c.Name
+                if ($c.IsPassword -or $c.ControlType.Id -eq 50004 -or $c.ControlType.Id -eq 50030) { $name = '(text omitted)' }
+                $outcome.data = [pscustomobject]@{
+                    target = $target; name = $name; controlType = $c.ControlType.ProgrammaticName
+                    automationId = $c.AutomationId; isPassword = $c.IsPassword
+                    patterns = @($element.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
+                }
+            }
+            'Step' { Invoke-UiaStep $request.step ([bool]$request.dryRun) }
+            default { throw 'Unknown worker request.' }
+        }
+        $outcome.ok = $true; $outcome.message = 'Completed'
+    } catch { $outcome.message = $_.Exception.Message }
+    $outcome.elapsedMs = $clock.ElapsedMilliseconds
+    Write-Json $ResponsePath $outcome
+}
+
+# A disposable PowerShell process bounds provider hangs and isolates UIA COM state.
+function Start-WorkerJob($Request, [int]$LimitMs) {
+    $base = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'DTORadarRecorder\Sessions'
+    $folder = Join-Path $base ([guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($folder)
+    $requestFile = Join-Path $folder 'request.json'
+    $responseFile = Join-Path $folder 'response.json'
+    Write-Json $requestFile $Request
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = Join-Path $PSHOME 'powershell.exe'
+    $info.Arguments = '-NoLogo -NoProfile -NonInteractive -Mta -File "{0}" -Worker -RequestPath "{1}" -ResponsePath "{2}"' -f $script:EntryPath, $requestFile, $responseFile
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    try { $process = [Diagnostics.Process]::Start($info) }
+    catch { Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue; throw }
+    return [pscustomobject]@{
+        process = $process; folder = $folder; response = $responseFile
+        clock = [Diagnostics.Stopwatch]::StartNew(); limitMs = $LimitMs
+    }
+}
+function Stop-WorkerJob($Job) {
+    if ($null -eq $Job) { return }
+    try {
+        if (-not $Job.process.HasExited) { $Job.process.Kill(); [void]$Job.process.WaitForExit(500) }
+    } catch { }
+    finally {
+        $Job.process.Dispose()
+        Remove-Item -LiteralPath $Job.folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+function Get-WorkerResult($Job) {
+    if (Test-Path -LiteralPath $Job.response) {
+        return Read-Json $Job.response
+    }
+    if ($Job.process.HasExited) {
+        return [pscustomobject]@{ ok = $false; message = "Worker exited without a result (exit $($Job.process.ExitCode)). Check PowerShell policy and UIA availability."; data = $null; elapsedMs = $Job.clock.ElapsedMilliseconds }
+    }
+    if ($Job.clock.ElapsedMilliseconds -gt $Job.limitMs) {
+        return [pscustomobject]@{ ok = $false; message = 'Worker time limit exceeded. If an action was already submitted, its outcome is unknown; inspect the target before retrying.'; data = $null; elapsedMs = $Job.clock.ElapsedMilliseconds }
+    }
+    return $null
+}
+function Get-StepLimit($Step) {
+    if ($Step.action -eq 'Delay') { return [int]$Step.arguments.milliseconds + 10000 }
+    return [int]$Step.timeoutMs + 10000
+}
+function New-Result($Step, [int]$Index, [string]$Status, [string]$Message, [long]$ElapsedMs) {
+    return [pscustomobject][ordered]@{
+        index = $Index + 1; stepId = $Step.id; label = $Step.label; action = $Step.action
+        status = $Status; message = $Message; elapsedMs = $ElapsedMs
+        timestampUtc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+function New-Report($Document, $Results, [bool]$ValidationOnly, [string]$Status) {
+    return [pscustomobject][ordered]@{
+        format = 'DTORadar.Run'; schemaVersion = 1; recordingName = $Document.name
+        dryRun = $ValidationOnly; status = $Status; endedUtc = [DateTime]::UtcNow.ToString('o')
+        results = @($Results)
+    }
+}
+function Invoke-ConsolePlayback {
+    $document = Read-Json $Play; Assert-Recording $document
+    $values = Get-Variables $document $VariablesFile
+    # Resolve ALL enabled steps before the first mutation, so missing variables fail early.
+    $resolved = @{}
+    for ($i = 0; $i -lt $document.steps.Count; $i++) {
+        if ($document.steps[$i].enabled) { $resolved[$i] = Resolve-StepData $document.steps[$i] $values }
+    }
+    $results = New-Object Collections.Generic.List[object]
+    $job = $null; $failed = $false; $halt = $false
+    try {
+        for ($i = 0; $i -lt $document.steps.Count; $i++) {
+            $step = $document.steps[$i]
+            if (-not $step.enabled -or $halt) {
+                $reason = 'Disabled'; if ($halt) { $reason = 'Earlier step stopped the run' }
+                $results.Add((New-Result $step $i 'Skipped' $reason 0)); continue
+            }
+            $job = Start-WorkerJob ([pscustomobject]@{ kind = 'Step'; step = $resolved[$i]; dryRun = [bool]$DryRun }) (Get-StepLimit $step)
+            do { Start-Sleep -Milliseconds 100; $response = Get-WorkerResult $job } while ($null -eq $response)
+            Stop-WorkerJob $job; $job = $null
+            $status = 'Passed'; if ($DryRun) { $status = 'Validated' }
+            if (-not $response.ok) { $status = 'Failed'; $failed = $true; $halt = $step.onError -eq 'Stop' }
+            $results.Add((New-Result $step $i $status $response.message $response.elapsedMs))
+            Write-Host ('{0,3}. {1,-10} {2}' -f ($i + 1), $status, $step.label)
+            if (-not $halt -and $document.settings.intervalMs -gt 0) { Start-Sleep -Milliseconds $document.settings.intervalMs }
+        }
+    } finally { Stop-WorkerJob $job }
+    $overall = 'Passed'; if ($DryRun) { $overall = 'Validated' }; if ($failed) { $overall = 'Failed' }
+    $report = New-Report $document $results.ToArray() ([bool]$DryRun) $overall
+    $destination = $ResultPath
+    if (-not $destination) { $destination = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($Play), ([DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff') + '.psrun.json')) }
+    Write-Json $destination $report
+    Write-Host "Results: $destination"
+    if ($failed) { exit 1 }
+    exit 0
+}
+
+function Write-UiLog([string]$Message) {
+    $u = $script:Ui
+    $u.Log.AppendText(('[{0}] {1}' -f [DateTime]::Now.ToString('HH:mm:ss'), $Message) + [Environment]::NewLine)
+    $u.Log.SelectionStart = $u.Log.TextLength; $u.Log.ScrollToCaret()
+}
+function Show-UiError($ErrorObject) {
+    $message = [string]$ErrorObject
+    Write-UiLog $message
+    [void][Windows.Forms.MessageBox]::Show($script:Ui.Form, $message, 'DTORadar Recorder', 'OK', 'Error')
+}
+function Set-UiBusy([bool]$Busy) {
+    foreach ($control in $script:Ui.BusyControls) { $control.Enabled = -not $Busy }
+    $script:Ui.StopButton.Enabled = $Busy
+}
+function Set-UiDirty {
+    $script:Ui.Dirty = $true
+    $script:Ui.Form.Text = 'DTORadar Recorder - ' + $script:Ui.Document.name + ' *'
+}
+function Get-UiIndex {
+    if ($script:Ui.Grid.SelectedRows.Count -eq 0) { return -1 }
+    return [int]$script:Ui.Grid.SelectedRows[0].Index
+}
+function Show-UiStep {
+    if ($script:Ui.Refreshing) { return }
+    $index = Get-UiIndex
+    if ($index -ge 0 -and $index -lt $script:Ui.Document.steps.Count) {
+        $script:Ui.Editor.Text = $script:Ui.Document.steps[$index] | ConvertTo-Json -Depth 80
+    } else { $script:Ui.Editor.Text = '' }
+}
+function Refresh-UiSteps([int]$SelectIndex = -1) {
+    $u = $script:Ui; $u.Refreshing = $true
+    try {
+        $u.Grid.Rows.Clear()
+        for ($i = 0; $i -lt $u.Document.steps.Count; $i++) {
+            $s = $u.Document.steps[$i]
+            $status = ''; if ($u.StepStatuses.ContainsKey($s.id)) { $status = $u.StepStatuses[$s.id] }
+            $on = 'Yes'; if (-not $s.enabled) { $on = 'No' }
+            [void]$u.Grid.Rows.Add([object[]]@(($i + 1), $on, $s.label, $s.action, $status))
+        }
+        $u.Grid.ClearSelection()
+        if ($SelectIndex -ge 0 -and $SelectIndex -lt $u.Grid.Rows.Count) {
+            $u.Grid.Rows[$SelectIndex].Selected = $true
+            $u.Grid.CurrentCell = $u.Grid.Rows[$SelectIndex].Cells[0]
+        }
+    } finally { $u.Refreshing = $false }
+    Show-UiStep
+}
+function Get-DefaultArguments([string]$Action) {
+    switch ($Action) {
+        'SetValue' { return [pscustomobject]@{ value = 'Your text or ${Customer}' } }
+        'SetRange' { return [pscustomobject]@{ value = 50 } }
+        'Scroll' { return [pscustomobject]@{ horizontal = 'NoAmount'; vertical = 'SmallIncrement' } }
+        'SetScrollPercent' { return [pscustomobject]@{ horizontal = -1; vertical = 50 } }
+        'AssertProperty' { return [pscustomobject]@{ property = 'Name'; operator = 'Equals'; expected = 'Expected text' } }
+        'Delay' { return [pscustomobject]@{ milliseconds = 1000 } }
+        default { return [pscustomobject]@{} }
+    }
+}
+function Get-ComposedStep {
+    $u = $script:Ui
+    $action = [string]$u.Action.SelectedItem
+    $target = $u.Target
+    if ($action -eq 'Delay') { $target = $null }
+    elseif ($null -eq $target) { throw 'Pick a target control first.' }
+    $arguments = $u.Arguments.Text | ConvertFrom-Json
+    $step = New-Step $action (Copy-Data $target) $arguments
+    if (-not [string]::IsNullOrWhiteSpace($u.StepLabel.Text)) { $step.label = $u.StepLabel.Text }
+    $step.timeoutMs = [int]$u.Timeout.Value
+    Assert-Step $step
+    return $step
+}
+function Add-UiStep($Step) {
+    $u = $script:Ui
+    $u.Document.steps = @($u.Document.steps) + @($Step)
+    Set-UiDirty; Refresh-UiSteps ($u.Document.steps.Count - 1)
+}
+function Start-UiAction([bool]$AppendOnly) {
+    try {
+        $step = Get-ComposedStep
+        if ($AppendOnly) { Add-UiStep $step; Write-UiLog 'Step appended without performing it.'; return }
+        $values = Get-Variables $script:Ui.Document $script:Ui.OverrideFile
+        $resolved = Resolve-StepData $step $values
+        $job = Start-WorkerJob ([pscustomobject]@{ kind = 'Step'; step = $resolved; dryRun = $false }) (Get-StepLimit $step)
+        $script:Ui.Job = $job; $script:Ui.JobKind = 'Record'; $script:Ui.PendingStep = $step
+        Set-UiBusy $true; $script:Ui.Status.Text = 'Performing action; it will be recorded after success...'
+    } catch { Show-UiError $_.Exception.Message }
+}
+function Start-UiPick {
+    $script:Ui.Target = $null
+    $script:Ui.TargetInfo.Text = 'Waiting to pick a target...'
+    $script:Ui.PickAt = [DateTime]::UtcNow.AddSeconds(3)
+    Set-UiBusy $true
+    $script:Ui.Status.Text = 'Move the mouse over the target control. Picking in 3 seconds...'
+}
+function Save-UiDocument([bool]$SaveAs = $false) {
+    $u = $script:Ui
+    try {
+        Assert-Recording $u.Document
+        $path = $u.File
+        if ($SaveAs -or -not $path) {
+            $dialog = New-Object Windows.Forms.SaveFileDialog
+            try {
+                $dialog.Filter = 'DTORadar recording (*.psrec)|*.psrec'; $dialog.DefaultExt = 'psrec'
+                $dialog.FileName = 'Recording.psrec'
+                if ($path) { $dialog.FileName = [IO.Path]::GetFileName($path); $dialog.InitialDirectory = [IO.Path]::GetDirectoryName($path) }
+                if ($dialog.ShowDialog($u.Form) -ne 'OK') { return $false }
+                $path = $dialog.FileName
+            } finally { $dialog.Dispose() }
+        }
+        Write-Json $path $u.Document
+        $u.File = $path; $u.Dirty = $false
+        $u.Form.Text = 'DTORadar Recorder - ' + $u.Document.name
+        Write-UiLog ('Saved ' + $path)
+        return $true
+    } catch { Show-UiError $_.Exception.Message; return $false }
+}
+function Confirm-UiDiscard {
+    if (-not $script:Ui.Dirty) { return $true }
+    $answer = [Windows.Forms.MessageBox]::Show($script:Ui.Form, 'Save changes to this recording?', 'Unsaved recording', 'YesNoCancel', 'Question')
+    if ($answer -eq 'Cancel') { return $false }
+    if ($answer -eq 'Yes') { return Save-UiDocument }
+    return $true
+}
+function Load-UiDocument([string]$Path) {
+    $document = Read-Json $Path; Assert-Recording $document
+    $u = $script:Ui
+    $u.Document = $document; $u.File = [IO.Path]::GetFullPath($Path); $u.Dirty = $false
+    $u.Target = $null; $u.TargetInfo.Text = 'Pick a control to record another step.'
+    $u.StepStatuses = @{}; $u.LastReport = $null; $u.OverrideFile = ''
+    $u.Form.Text = 'DTORadar Recorder - ' + $document.name
+    Refresh-UiSteps
+    Write-UiLog ('Opened ' + $Path)
+}
+function Open-UiDocument {
+    if (-not (Confirm-UiDiscard)) { return }
+    $dialog = New-Object Windows.Forms.OpenFileDialog
+    try {
+        $dialog.Filter = 'DTORadar recording (*.psrec)|*.psrec|JSON files (*.json)|*.json'
+        if ($dialog.ShowDialog($script:Ui.Form) -eq 'OK') { Load-UiDocument $dialog.FileName }
+    } catch { Show-UiError $_.Exception.Message }
+    finally { $dialog.Dispose() }
+}
+function New-UiDocument {
+    if (-not (Confirm-UiDiscard)) { return }
+    $u = $script:Ui
+    $u.Document = New-Recording; $u.File = ''; $u.Dirty = $false; $u.OverrideFile = ''
+    $u.Target = $null; $u.TargetInfo.Text = 'Pick a control to start recording.'
+    $u.StepStatuses = @{}; $u.LastReport = $null
+    $u.Form.Text = 'DTORadar Recorder - Untitled recording'; Refresh-UiSteps
+}
+function Show-JsonDialog([string]$Title, $Value) {
+    $dialog = New-Object Windows.Forms.Form
+    $dialog.Text = $Title; $dialog.Width = 720; $dialog.Height = 530
+    $dialog.StartPosition = 'CenterParent'; $dialog.MinimizeBox = $false; $dialog.MaximizeBox = $false
+    $edit = New-Object Windows.Forms.TextBox
+    $edit.Multiline = $true; $edit.ScrollBars = 'Both'; $edit.WordWrap = $false
+    $edit.Font = New-Object Drawing.Font('Consolas',10)
+    $edit.Dock = 'Fill'; $edit.Text = $Value | ConvertTo-Json -Depth 80
+    $bar = New-Object Windows.Forms.FlowLayoutPanel
+    $bar.Dock = 'Bottom'; $bar.Height = 42; $bar.FlowDirection = 'RightToLeft'
+    $ok = New-Object Windows.Forms.Button; $ok.Text = 'Apply'; $ok.DialogResult = 'OK'
+    $cancel = New-Object Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'
+    $bar.Controls.Add($ok); $bar.Controls.Add($cancel)
+    $dialog.Controls.Add($edit); $dialog.Controls.Add($bar); $dialog.AcceptButton = $ok; $dialog.CancelButton = $cancel
+    try {
+        if ($dialog.ShowDialog($script:Ui.Form) -eq 'OK') { return ($edit.Text | ConvertFrom-Json) }
+        return $null
+    } finally { $dialog.Dispose() }
+}
+function Edit-UiSettings {
+    try {
+        $u = $script:Ui
+        $value = [pscustomobject]@{ name = $u.Document.name; description = $u.Document.description; variables = $u.Document.variables; settings = $u.Document.settings }
+        $edited = Show-JsonDialog 'Recording settings and variables (values are saved in plain text)' $value
+        if ($null -eq $edited) { return }
+        Assert-Fields $edited @('name','description','variables','settings') @('name','description','variables','settings') 'settings editor'
+        $candidate = Copy-Data $u.Document
+        foreach ($key in @('name','description','variables','settings')) { $candidate.$key = $edited.$key }
+        Assert-Recording $candidate; $u.Document = $candidate; Set-UiDirty
+    } catch { Show-UiError $_.Exception.Message }
+}
+function Set-UiOverrides {
+    $dialog = New-Object Windows.Forms.OpenFileDialog
+    try {
+        $dialog.Filter = 'Variable values (*.json)|*.json'
+        $dialog.Title = 'Select runtime variables; contents are not copied into the recording'
+        if ($dialog.ShowDialog($script:Ui.Form) -eq 'OK') {
+            $data = Read-Json $dialog.FileName; Assert-Variables $data
+            $script:Ui.OverrideFile = $dialog.FileName
+            Write-UiLog ('Runtime variables: ' + [IO.Path]::GetFileName($dialog.FileName))
+        }
+    } catch { Show-UiError $_.Exception.Message }
+    finally { $dialog.Dispose() }
+}
+function Apply-UiStep {
+    try {
+        $i = Get-UiIndex; if ($i -lt 0) { return }
+        $candidate = Copy-Data $script:Ui.Document
+        $candidate.steps[$i] = $script:Ui.Editor.Text | ConvertFrom-Json
+        Assert-Recording $candidate
+        $script:Ui.Document = $candidate; Set-UiDirty; Refresh-UiSteps $i
+    } catch { Show-UiError $_.Exception.Message }
+}
+function Change-UiStep([string]$Operation) {
+    $u = $script:Ui; $i = Get-UiIndex; if ($i -lt 0) { return }
+    $steps = New-Object Collections.Generic.List[object]
+    foreach ($s in $u.Document.steps) { $steps.Add($s) }
+    switch ($Operation) {
+        'Up' { if ($i -eq 0) { return }; $s = $steps[$i]; $steps.RemoveAt($i); $i--; $steps.Insert($i,$s) }
+        'Down' { if ($i -eq $steps.Count - 1) { return }; $s = $steps[$i]; $steps.RemoveAt($i); $i++; $steps.Insert($i,$s) }
+        'Duplicate' { $s = Copy-Data $steps[$i]; $s.id = [guid]::NewGuid().ToString(); $i++; $steps.Insert($i,$s) }
+        'Toggle' { $steps[$i].enabled = -not $steps[$i].enabled }
+        'Delete' { $steps.RemoveAt($i); $i = [Math]::Min($i,$steps.Count - 1) }
+    }
+    $u.Document.steps = @($steps.ToArray()); Set-UiDirty; Refresh-UiSteps $i
+}
+function Use-UiTarget {
+    $i = Get-UiIndex; if ($i -lt 0) { return }
+    $s = $script:Ui.Document.steps[$i]
+    $script:Ui.Target = Copy-Data $s.target
+    $script:Ui.TargetInfo.Text = 'Using selected step target. See selected step JSON for its locator.'
+    $script:Ui.Action.SelectedItem = $s.action
+    $script:Ui.Arguments.Text = $s.arguments | ConvertTo-Json -Depth 80
+    $script:Ui.StepLabel.Text = $s.label; $script:Ui.Timeout.Value = $s.timeoutMs
+}
+function Start-UiPlayback([bool]$SelectedOnly) {
+    try {
+        $u = $script:Ui; Assert-Recording $u.Document
+        $indices = @()
+        if ($SelectedOnly) { $selected = Get-UiIndex; if ($selected -lt 0) { throw 'Select a step first.' }; $indices = @($selected) }
+        else { for ($i = 0; $i -lt $u.Document.steps.Count; $i++) { $indices += $i } }
+        Assert-That ($indices.Count -gt 0) 'Add or open a recording first.'
+        $values = Get-Variables $u.Document $u.OverrideFile
+        $resolved = @{}
+        foreach ($i in $indices) { if ($u.Document.steps[$i].enabled) { $resolved[$i] = Resolve-StepData $u.Document.steps[$i] $values } }
+        $u.Run = [pscustomobject]@{
+            indices = $indices; position = 0; resolved = $resolved
+            results = (New-Object Collections.Generic.List[object]); dryRun = [bool]$u.DryRun.Checked
+            failed = $false; readyAt = [DateTime]::UtcNow
+        }
+        $u.LastReport = $null; $u.StepStatuses = @{}
+        Set-UiBusy $true
+        $label = 'Playback started.'; if ($u.Run.dryRun) { $label = 'Dry run started: targets are checked against the current screen; actions are not performed.' }
+        Write-UiLog $label
+    } catch { Show-UiError $_.Exception.Message }
+}
+function Finish-UiPlayback([string]$Status) {
+    $u = $script:Ui; if ($null -eq $u.Run) { return }
+    $u.LastReport = New-Report $u.Document $u.Run.results.ToArray() $u.Run.dryRun $Status
+    $u.Run = $null; Set-UiBusy $false
+    $u.Status.Text = 'Run ' + $Status + '. Use Export results to save the report.'
+    Write-UiLog $u.Status.Text
+}
+function Stop-UiActivity {
+    $u = $script:Ui
+    $u.PickAt = $null
+    if ($null -ne $u.Job) { Stop-WorkerJob $u.Job; $u.Job = $null }
+    if ($null -ne $u.Run) {
+        for ($p = $u.Run.position; $p -lt $u.Run.indices.Count; $p++) {
+            $i = $u.Run.indices[$p]; $s = $u.Document.steps[$i]
+            $status = 'Skipped'; $message = 'Run stopped.'
+            if ($p -eq $u.Run.position -and $u.JobKind -eq 'Playback') { $status = 'Cancelled'; $message = 'Stopped; an already submitted action may have taken effect.' }
+            $u.Run.results.Add((New-Result $s $i $status $message 0)); $u.StepStatuses[$s.id] = $status
+        }
+        Finish-UiPlayback 'Stopped'; Refresh-UiSteps
+    }
+    $u.JobKind = ''; Set-UiBusy $false
+    $u.PendingStep = $null
+    $u.Status.Text = 'Stopped. An already submitted action cannot be undone.'
+    Write-UiLog $u.Status.Text
+}
+function Tick-Ui {
+    $u = $script:Ui
+    if ($null -ne $u.PickAt) {
+        $remaining = ($u.PickAt - [DateTime]::UtcNow).TotalSeconds
+        if ($remaining -gt 0) { $u.Status.Text = 'Point at the target control. Picking in ' + [Math]::Ceiling($remaining) + '...'; return }
+        $u.PickAt = $null
+        $point = [Windows.Forms.Cursor]::Position
+        $u.Job = Start-WorkerJob ([pscustomobject]@{ kind = 'Pick'; x = $point.X; y = $point.Y; ownerProcessId = $PID }) 15000
+        $u.JobKind = 'Pick'; $u.Status.Text = 'Inspecting the target...'
+    }
+    if ($null -ne $u.Job) {
+        $result = Get-WorkerResult $u.Job; if ($null -eq $result) { return }
+        Stop-WorkerJob $u.Job; $u.Job = $null
+        $kind = $u.JobKind; $u.JobKind = ''
+        if ($kind -eq 'Pick') {
+            Set-UiBusy $false
+            if ($result.ok) {
+                $data = $result.data; $u.Target = $data.target
+                $u.TargetInfo.Text = "Name: $($data.name)`r`nType: $($data.controlType)`r`nAutomationId: $($data.automationId)`r`nWindow: $($data.target.window.title)`r`nPatterns: $($data.patterns -join ', ')"
+                $u.Status.Text = 'Target captured. Choose an action and Perform + record.'
+                Write-UiLog 'Target captured.'
+            } else { $u.Status.Text = 'Pick failed.'; Show-UiError $result.message }
+            return
+        }
+        if ($kind -eq 'Record') {
+            Set-UiBusy $false
+            if ($result.ok) { Add-UiStep $u.PendingStep; $u.Status.Text = 'Action completed and step recorded.'; Write-UiLog $u.Status.Text }
+            else { $u.Status.Text = 'Action failed; no step recorded.'; Show-UiError $result.message }
+            $u.PendingStep = $null; return
+        }
+        if ($kind -eq 'Playback') {
+            $i = $u.Run.indices[$u.Run.position]; $step = $u.Document.steps[$i]
+            $status = 'Passed'; if ($u.Run.dryRun) { $status = 'Validated' }
+            if (-not $result.ok) { $status = 'Failed'; $u.Run.failed = $true }
+            $u.Run.results.Add((New-Result $step $i $status $result.message $result.elapsedMs))
+            $u.StepStatuses[$step.id] = $status
+            Write-UiLog ("Step {0}: {1}. {2}" -f ($i + 1), $status, $result.message)
+            $u.Run.position++
+            Refresh-UiSteps $i
+            if (-not $result.ok -and $step.onError -eq 'Stop') {
+                for ($p = $u.Run.position; $p -lt $u.Run.indices.Count; $p++) {
+                    $j = $u.Run.indices[$p]; $other = $u.Document.steps[$j]
+                    $u.Run.results.Add((New-Result $other $j 'Skipped' 'Earlier step stopped the run.' 0)); $u.StepStatuses[$other.id] = 'Skipped'
+                }
+                Finish-UiPlayback 'Failed'; Refresh-UiSteps $i; return
+            }
+            $u.Run.readyAt = [DateTime]::UtcNow.AddMilliseconds($u.Document.settings.intervalMs)
+        }
+    }
+    if ($null -ne $u.Run -and [DateTime]::UtcNow -ge $u.Run.readyAt) {
+        while ($u.Run.position -lt $u.Run.indices.Count) {
+            $i = $u.Run.indices[$u.Run.position]; $step = $u.Document.steps[$i]
+            if ($step.enabled) { break }
+            $u.Run.results.Add((New-Result $step $i 'Skipped' 'Disabled' 0)); $u.StepStatuses[$step.id] = 'Skipped'; $u.Run.position++
+        }
+        if ($u.Run.position -ge $u.Run.indices.Count) {
+            $status = 'Passed'; if ($u.Run.dryRun) { $status = 'Validated' }; if ($u.Run.failed) { $status = 'Failed' }
+            Finish-UiPlayback $status; Refresh-UiSteps; return
+        }
+        $i = $u.Run.indices[$u.Run.position]; $step = $u.Document.steps[$i]
+        $u.Job = Start-WorkerJob ([pscustomobject]@{ kind = 'Step'; step = $u.Run.resolved[$i]; dryRun = $u.Run.dryRun }) (Get-StepLimit $step)
+        $u.JobKind = 'Playback'; $u.StepStatuses[$step.id] = 'Running'; Refresh-UiSteps $i
+        $u.Status.Text = 'Running step ' + ($i + 1) + ': ' + $step.label
+    }
+}
+function Export-UiResults {
+    if ($null -eq $script:Ui.LastReport) { Show-UiError 'Complete or stop a run first.'; return }
+    $dialog = New-Object Windows.Forms.SaveFileDialog
+    try {
+        $dialog.Filter = 'Run results (*.psrun.json)|*.psrun.json'; $dialog.DefaultExt = 'psrun.json'
+        $dialog.FileName = 'Run-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss') + '.psrun.json'
+        if ($dialog.ShowDialog($script:Ui.Form) -eq 'OK') { Write-Json $dialog.FileName $script:Ui.LastReport; Write-UiLog 'Results exported.' }
+    } catch { Show-UiError $_.Exception.Message }
+    finally { $dialog.Dispose() }
+}
+
+function New-UiButton($Parent, [string]$Text, [scriptblock]$Handler, [bool]$Protect = $true) {
+    $button = New-Object Windows.Forms.Button
+    $button.Text = $Text; $button.AutoSize = $true; $button.Height = 30
+    $button.Padding = New-Object Windows.Forms.Padding(5,2,5,2)
+    $button.Add_Click($Handler); $Parent.Controls.Add($button)
+    if ($Protect) { $script:Ui.BusyControls.Add($button) }
+    return $button
+}
+function New-UiLabel([string]$Text) {
+    $label = New-Object Windows.Forms.Label
+    $label.Text = $Text; $label.AutoSize = $true
+    $label.Margin = New-Object Windows.Forms.Padding(3,7,3,3)
+    return $label
+}
+function Start-DemoProcess {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = Join-Path $PSHOME 'powershell.exe'
+    $info.Arguments = '-NoLogo -NoProfile -STA -File "{0}" -Demo' -f $script:EntryPath
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($info); $p.Dispose()
+}
+function Show-Recorder {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $script:Ui = @{
+        Document = (New-Recording); File = ''; Dirty = $false; Target = $null
+        OverrideFile = $VariablesFile; PickAt = $null; Job = $null; JobKind = ''
+        PendingStep = $null; Run = $null; LastReport = $null; Refreshing = $false
+        BusyControls = (New-Object Collections.Generic.List[object]); StepStatuses = @{}
+    }
+    $u = $script:Ui
+    $form = New-Object Windows.Forms.Form; $u.Form = $form
+    $form.Text = 'DTORadar Recorder - Untitled recording'
+    $form.Size = New-Object Drawing.Size(1280,900)
+    $form.MinimumSize = New-Object Drawing.Size(1080,760)
+    $form.StartPosition = 'CenterScreen'; $form.Font = New-Object Drawing.Font('Segoe UI',9)
+    $form.AutoScaleMode = 'Font'; $form.KeyPreview = $true
+
+    $root = New-Object Windows.Forms.TableLayoutPanel
+    $root.Dock = 'Fill'; $root.ColumnCount = 1; $root.RowCount = 5
+    $root.Padding = New-Object Windows.Forms.Padding(10)
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',42)))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',100)))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',110)))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',28)))
+    $form.Controls.Add($root)
+    $toolbar = New-Object Windows.Forms.FlowLayoutPanel
+    $toolbar.Dock = 'Fill'; $toolbar.AutoSize = $true
+    $root.Controls.Add($toolbar,0,0)
+    [void](New-UiButton $toolbar 'New' { New-UiDocument })
+    [void](New-UiButton $toolbar 'Open' { Open-UiDocument })
+    [void](New-UiButton $toolbar 'Save' { [void](Save-UiDocument) })
+    [void](New-UiButton $toolbar 'Save as' { [void](Save-UiDocument $true) })
+    [void](New-UiButton $toolbar 'Settings / variables' { Edit-UiSettings })
+    [void](New-UiButton $toolbar 'Runtime variables' { Set-UiOverrides })
+    [void](New-UiButton $toolbar 'Clear overrides' { $script:Ui.OverrideFile = ''; Write-UiLog 'Runtime variable overrides cleared.' })
+    [void](New-UiButton $toolbar 'Demo window' { try { Start-DemoProcess } catch { Show-UiError $_.Exception.Message } })
+    $u.StopButton = New-UiButton $toolbar 'STOP' { Stop-UiActivity } $false
+    $u.StopButton.BackColor = [Drawing.Color]::MistyRose; $u.StopButton.Enabled = $false
+    $hint = New-UiLabel '1  Pick a control     2  Choose its action     3  Perform + record     4  Save and play the sequence'
+    $hint.Dock = 'Fill'; $hint.Font = New-Object Drawing.Font('Segoe UI',10,[Drawing.FontStyle]::Bold)
+    $root.Controls.Add($hint,0,1)
+
+    $split = New-Object Windows.Forms.SplitContainer
+    $split.Dock = 'Fill'; $split.Orientation = 'Vertical'
+    # Set a real size before minimum sizes/splitter distance (WinForms defaults to 150px).
+    $split.Size = New-Object Drawing.Size(1220,550)
+    $split.Panel1MinSize = 310; $split.Panel2MinSize = 500; $split.SplitterDistance = 365
+    $root.Controls.Add($split,0,2)
+    $left = New-Object Windows.Forms.TableLayoutPanel
+    $left.Dock = 'Fill'; $left.ColumnCount = 1; $left.RowCount = 12
+    foreach ($height in @(38,112,24,30,24,32,24,90,32,38,38)) {
+        [void]$left.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',$height)))
+    }
+    [void]$left.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',100)))
+    $left.AutoScroll = $true; $split.Panel1.Controls.Add($left)
+    $pickBar = New-Object Windows.Forms.FlowLayoutPanel; $pickBar.Dock = 'Fill'
+    [void](New-UiButton $pickBar 'Pick control in 3 seconds' { Start-UiPick }); $left.Controls.Add($pickBar,0,0)
+    $u.TargetInfo = New-Object Windows.Forms.TextBox
+    $u.TargetInfo.Multiline = $true; $u.TargetInfo.ReadOnly = $true; $u.TargetInfo.ScrollBars = 'Vertical'; $u.TargetInfo.Dock = 'Fill'
+    $u.TargetInfo.Text = 'This is an action recorder. Pick a control, then perform its action here. Text entry and physical mouse clicks outside this window are not recorded.'
+    $left.Controls.Add($u.TargetInfo,0,1)
+    $left.Controls.Add((New-UiLabel 'Step label (optional)'),0,2)
+    $u.StepLabel = New-Object Windows.Forms.TextBox; $u.StepLabel.Dock = 'Fill'; $left.Controls.Add($u.StepLabel,0,3)
+    $left.Controls.Add((New-UiLabel 'Action'),0,4)
+    $u.Action = New-Object Windows.Forms.ComboBox
+    $u.Action.Dock = 'Fill'; $u.Action.DropDownStyle = 'DropDownList'
+    $u.Action.Items.AddRange([object[]]$script:Actions); $left.Controls.Add($u.Action,0,5)
+    $left.Controls.Add((New-UiLabel 'Arguments (JSON; text can use ${Variable})'),0,6)
+    $u.Arguments = New-Object Windows.Forms.TextBox
+    $u.Arguments.Multiline = $true; $u.Arguments.ScrollBars = 'Both'; $u.Arguments.Dock = 'Fill'
+    $u.Arguments.Font = New-Object Drawing.Font('Consolas',10); $u.Arguments.Text = '{}'
+    $left.Controls.Add($u.Arguments,0,7)
+    $timeoutBar = New-Object Windows.Forms.FlowLayoutPanel; $timeoutBar.Dock = 'Fill'
+    $timeoutBar.Controls.Add((New-UiLabel 'Target timeout (ms)'))
+    $u.Timeout = New-Object Windows.Forms.NumericUpDown
+    $u.Timeout.Minimum = 100; $u.Timeout.Maximum = 300000; $u.Timeout.Value = 10000
+    $u.Timeout.Increment = 100; $u.Timeout.Width = 110; $timeoutBar.Controls.Add($u.Timeout)
+    $left.Controls.Add($timeoutBar,0,8)
+    $recordBar = New-Object Windows.Forms.FlowLayoutPanel; $recordBar.Dock = 'Fill'
+    $recordButton = New-UiButton $recordBar 'Perform + record' { Start-UiAction $false }
+    $recordButton.BackColor = [Drawing.Color]::LightCyan
+    [void](New-UiButton $recordBar 'Append only' { Start-UiAction $true }); $left.Controls.Add($recordBar,0,9)
+    $reuseBar = New-Object Windows.Forms.FlowLayoutPanel; $reuseBar.Dock = 'Fill'
+    [void](New-UiButton $reuseBar 'Use selected step target' { Use-UiTarget }); $left.Controls.Add($reuseBar,0,10)
+    $note = New-UiLabel 'Perform + record acts on the real application now. Add an AssertProperty step to verify the result. Unsupported UIA actions report an error.'
+    $note.Dock = 'Fill'; $left.Controls.Add($note,0,11)
+    foreach ($c in @($u.StepLabel,$u.Action,$u.Arguments,$u.Timeout)) { $u.BusyControls.Add($c) }
+    $u.Action.Add_SelectedIndexChanged({
+        $script:Ui.Arguments.Text = Get-DefaultArguments ([string]$script:Ui.Action.SelectedItem) | ConvertTo-Json -Depth 80
+    })
+    $u.Action.SelectedIndex = 0
+
+    $right = New-Object Windows.Forms.TableLayoutPanel
+    $right.Dock = 'Fill'; $right.ColumnCount = 1; $right.RowCount = 6
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',55)))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',25)))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent',45)))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute',37)))
+    $split.Panel2.Controls.Add($right)
+    $playbar = New-Object Windows.Forms.FlowLayoutPanel; $playbar.Dock = 'Fill'; $playbar.AutoSize = $true
+    [void](New-UiButton $playbar 'Play all' { Start-UiPlayback $false })
+    [void](New-UiButton $playbar 'Play selected' { Start-UiPlayback $true })
+    $u.DryRun = New-Object Windows.Forms.CheckBox
+    $u.DryRun.Text = 'Dry run'; $u.DryRun.AutoSize = $true; $u.DryRun.Margin = New-Object Windows.Forms.Padding(8,9,8,3)
+    $playbar.Controls.Add($u.DryRun); $u.BusyControls.Add($u.DryRun)
+    [void](New-UiButton $playbar 'Export results' { Export-UiResults }); $right.Controls.Add($playbar,0,0)
+    $u.Grid = New-Object Windows.Forms.DataGridView
+    $u.Grid.Dock = 'Fill'; $u.Grid.ReadOnly = $true; $u.Grid.AllowUserToAddRows = $false
+    $u.Grid.AllowUserToDeleteRows = $false; $u.Grid.AllowUserToResizeRows = $false
+    $u.Grid.MultiSelect = $false; $u.Grid.RowHeadersVisible = $false; $u.Grid.SelectionMode = 'FullRowSelect'
+    $u.Grid.AutoSizeColumnsMode = 'Fill'; $u.Grid.BackgroundColor = [Drawing.Color]::White
+    foreach ($spec in @(@('number','#',30),@('enabled','Enabled',55),@('label','Step',180),@('action','Action',100),@('status','Status',80))) {
+        $col = New-Object Windows.Forms.DataGridViewTextBoxColumn
+        $col.Name = $spec[0]; $col.HeaderText = $spec[1]; $col.FillWeight = $spec[2]; $col.SortMode = 'NotSortable'
+        [void]$u.Grid.Columns.Add($col)
+    }
+    $right.Controls.Add($u.Grid,0,1); $u.BusyControls.Add($u.Grid)
+    $editbar = New-Object Windows.Forms.FlowLayoutPanel; $editbar.Dock = 'Fill'; $editbar.AutoSize = $true
+    [void](New-UiButton $editbar 'Up' { Change-UiStep 'Up' })
+    [void](New-UiButton $editbar 'Down' { Change-UiStep 'Down' })
+    [void](New-UiButton $editbar 'Duplicate' { Change-UiStep 'Duplicate' })
+    [void](New-UiButton $editbar 'Enable / disable' { Change-UiStep 'Toggle' })
+    [void](New-UiButton $editbar 'Delete' { Change-UiStep 'Delete' })
+    $right.Controls.Add($editbar,0,2)
+    $right.Controls.Add((New-UiLabel 'Selected step JSON - click Apply to commit edits'),0,3)
+    $u.Editor = New-Object Windows.Forms.TextBox
+    $u.Editor.Multiline = $true; $u.Editor.WordWrap = $false; $u.Editor.ScrollBars = 'Both'; $u.Editor.Dock = 'Fill'
+    $u.Editor.Font = New-Object Drawing.Font('Consolas',10); $right.Controls.Add($u.Editor,0,4); $u.BusyControls.Add($u.Editor)
+    $applybar = New-Object Windows.Forms.FlowLayoutPanel; $applybar.Dock = 'Fill'
+    [void](New-UiButton $applybar 'Apply step JSON' { Apply-UiStep }); $right.Controls.Add($applybar,0,5)
+    $u.Grid.Add_SelectionChanged({ Show-UiStep })
+    $u.Log = New-Object Windows.Forms.TextBox
+    $u.Log.Multiline = $true; $u.Log.ReadOnly = $true; $u.Log.ScrollBars = 'Vertical'; $u.Log.Dock = 'Fill'
+    $root.Controls.Add($u.Log,0,3)
+    $u.Status = New-UiLabel 'Ready. Open the demo window to try a recording.'; $u.Status.Dock = 'Fill'; $root.Controls.Add($u.Status,0,4)
+    $timer = New-Object Windows.Forms.Timer; $timer.Interval = 100
+    $timer.Add_Tick({ try { Tick-Ui } catch { Stop-UiActivity; Show-UiError $_.Exception.Message } })
+    $form.Add_KeyDown({ if ($_.KeyCode -eq 'Escape' -and $script:Ui.StopButton.Enabled) { Stop-UiActivity; $_.Handled = $true } })
+    $form.Add_FormClosing({
+        if ($script:Ui.StopButton.Enabled) { Stop-UiActivity }
+        if (-not (Confirm-UiDiscard)) { $_.Cancel = $true; return }
+    })
+    try {
+        if ($Open) { Load-UiDocument $Open }
+        if ($VariablesFile) { [void](Get-Variables $u.Document $VariablesFile); $u.OverrideFile = $VariablesFile }
+        $timer.Start(); [void]$form.ShowDialog()
+    } finally { $timer.Stop(); $timer.Dispose(); Stop-WorkerJob $u.Job; $form.Dispose() }
+}
+
+function Show-DemoWindow {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $script:DemoForm = New-Object Windows.Forms.Form
+    $f = $script:DemoForm; $f.Text = 'DTORadar Demo'; $f.ClientSize = New-Object Drawing.Size(490,270)
+    $f.StartPosition = 'CenterScreen'; $f.Font = New-Object Drawing.Font('Segoe UI',10)
+    $label = New-Object Windows.Forms.Label; $label.Text = 'Customer name'; $label.Location = New-Object Drawing.Point(20,20); $label.AutoSize = $true
+    $script:DemoName = New-Object Windows.Forms.TextBox
+    $script:DemoName.Name = 'CustomerName'; $script:DemoName.AccessibleName = 'Customer name'
+    $script:DemoName.Location = New-Object Drawing.Point(20,48); $script:DemoName.Size = New-Object Drawing.Size(440,28)
+    $script:DemoCheck = New-Object Windows.Forms.CheckBox
+    $script:DemoCheck.Name = 'IncludeDetails'; $script:DemoCheck.Text = 'Include details'; $script:DemoCheck.AccessibleName = 'Include details'
+    $script:DemoCheck.Location = New-Object Drawing.Point(20,90); $script:DemoCheck.AutoSize = $true
+    $submit = New-Object Windows.Forms.Button; $submit.Name = 'Submit'; $submit.Text = 'Submit'
+    $submit.AccessibleName = 'Submit'; $submit.Location = New-Object Drawing.Point(20,132); $submit.Size = New-Object Drawing.Size(120,34)
+    $reset = New-Object Windows.Forms.Button; $reset.Text = 'Reset'; $reset.AccessibleName = 'Reset'
+    $reset.Location = New-Object Drawing.Point(155,132); $reset.Size = New-Object Drawing.Size(120,34)
+    $script:DemoStatus = New-Object Windows.Forms.TextBox
+    $script:DemoStatus.Name = 'Result'; $script:DemoStatus.AccessibleName = 'Result'
+    $script:DemoStatus.Text = 'Ready'; $script:DemoStatus.Location = New-Object Drawing.Point(20,190); $script:DemoStatus.Size = New-Object Drawing.Size(440,60)
+    $script:DemoStatus.ReadOnly = $true; $script:DemoStatus.Multiline = $true
+    $submit.Add_Click({
+        $suffix = ''; if ($script:DemoCheck.Checked) { $suffix = ' (details included)' }
+        $script:DemoStatus.Text = 'Submitted: ' + $script:DemoName.Text + $suffix
+    })
+    $reset.Add_Click({ $script:DemoName.Clear(); $script:DemoCheck.Checked = $false; $script:DemoStatus.Text = 'Ready' })
+    $f.Controls.AddRange([Windows.Forms.Control[]]@($label,$script:DemoName,$script:DemoCheck,$submit,$reset,$script:DemoStatus))
+    try { [void]$f.ShowDialog() } finally { $f.Dispose() }
+}
+
+function Test-ExpectThrow([scriptblock]$Body) {
+    $thrown = $false
+    try { & $Body } catch { $thrown = $true }
+    Assert-That $thrown 'Expected an error, but the operation succeeded.'
+}
+function Test-Case([string]$Name, [scriptblock]$Body) {
+    try { & $Body; $script:TestPassed++; Write-Host ('PASS ' + $Name) }
+    catch { $script:TestFailed++; Write-Host ('FAIL ' + $Name + ': ' + $_.Exception.Message) }
+}
+function Invoke-SelfTests {
+    $script:TestPassed = 0; $script:TestFailed = 0
+    $target = [pscustomobject]@{
+        window = [pscustomobject]@{ processName = 'demo'; className = ''; title = 'Demo'; titleMatch = 'Exact' }
+        path = @([pscustomobject]@{ automationId = 'input'; name = ''; className = ''; controlType = 50004; useName = $false; index = 0; matchCount = 1 })
+    }
+    $document = New-Recording
+    $document.variables = [pscustomobject]@{ Customer = 'Mira'; Empty = '' }
+    $document.steps = @((New-Step 'SetValue' $target ([pscustomobject]@{ value = '${Customer}' })))
+    Test-Case 'Empty recording and JSON array round trip' {
+        $d = Copy-Data (New-Recording); Assert-Recording $d
+        Assert-That ($d.steps -is [array] -and $d.steps.Count -eq 0) 'Empty array lost.'
+    }
+    Test-Case 'One-step recording and one-segment path round trip' {
+        $d = Copy-Data $document; Assert-Recording $d
+        Assert-That ($d.steps.Count -eq 1 -and $d.steps[0].target.path.Count -eq 1) 'Array changed.'
+    }
+    Test-Case 'Window-only target permits an empty path' {
+        $d = Copy-Data $document; $d.steps[0].target.path = @(); Assert-Recording $d
+    }
+    Test-Case 'Reject unknown format' { $d = Copy-Data $document; $d.format = 'Other'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject unsupported schema version' { $d = Copy-Data $document; $d.schemaVersion = 2; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject boolean schema version' { $d = Copy-Data $document; $d.schemaVersion = $true; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject unknown top-level field' { $d = Copy-Data $document; $d | Add-Member NoteProperty script 'evil'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject missing required field' { $d = Copy-Data $document; $d.PSObject.Properties.Remove('settings'); Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject singleton object in place of steps array' { $d = Copy-Data $document; $d.steps = $d.steps[0]; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject duplicate step identity' { $d = Copy-Data $document; $d.steps += (Copy-Data $d.steps[0]); Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject executable action' { $d = Copy-Data $document; $d.steps[0].action = 'Invoke-Expression'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject unexpected step field' { $d = Copy-Data $document; $d.steps[0] | Add-Member NoteProperty code '1'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject string enabled flag' { $d = Copy-Data $document; $d.steps[0].enabled = 'false'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject zero timeout' { $d = Copy-Data $document; $d.steps[0].timeoutMs = 0; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject negative pacing' { $d = Copy-Data $document; $d.settings.intervalMs = -1; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject unsupported failure policy' { $d = Copy-Data $document; $d.steps[0].onError = 'Retry'; Test-ExpectThrow { Assert-Recording $d } }
+    Test-Case 'Reject out-of-bounds locator index' { $t = Copy-Data $target; $t.path[0].index = 1; Test-ExpectThrow { Assert-Target $t } }
+    Test-Case 'Reject missing locator path' { $t = Copy-Data $target; $t.PSObject.Properties.Remove('path'); Test-ExpectThrow { Assert-Target $t } }
+    Test-Case 'Reject empty window process' { $t = Copy-Data $target; $t.window.processName = ''; Test-ExpectThrow { Assert-Target $t } }
+    Test-Case 'Reject non-UIA control type' { $t = Copy-Data $target; $t.path[0].controlType = 42; Test-ExpectThrow { Assert-Target $t } }
+    Test-Case 'Reject null action arguments' { $s = Copy-Data $document.steps[0]; $s.arguments = $null; Test-ExpectThrow { Assert-Step $s } }
+    Test-Case 'Delay accepts zero milliseconds' { Assert-Step (New-Step 'Delay' $null ([pscustomobject]@{ milliseconds = 0 })) }
+    Test-Case 'Reject Delay with a target' { Test-ExpectThrow { Assert-Step (New-Step 'Delay' $target ([pscustomobject]@{ milliseconds = 1 })) } }
+    Test-Case 'Reject negative Delay' { Test-ExpectThrow { Assert-Step (New-Step 'Delay' $null ([pscustomobject]@{ milliseconds = -1 })) } }
+    Test-Case 'Reject fractional Delay' { Test-ExpectThrow { Assert-Step (New-Step 'Delay' $null ([pscustomobject]@{ milliseconds = 0.5 })) } }
+    Test-Case 'All action argument defaults have valid schemas' {
+        foreach ($action in $script:Actions) {
+            $t = $target; if ($action -eq 'Delay') { $t = $null }
+            Assert-Step (New-Step $action $t (Get-DefaultArguments $action))
+        }
+    }
+    Test-Case 'Reject arbitrary assertion property' {
+        Test-ExpectThrow { Assert-Step (New-Step 'AssertProperty' $target ([pscustomobject]@{ property = 'Password'; operator = 'Equals'; expected = '' })) }
+    }
+    Test-Case 'Reject invalid scrolling enumeration' {
+        Test-ExpectThrow { Assert-Step (New-Step 'Scroll' $target ([pscustomobject]@{ horizontal = 'Left'; vertical = 'NoAmount' })) }
+    }
+    Test-Case 'Reject fractional negative scroll percentage' {
+        Test-ExpectThrow { Assert-Step (New-Step 'SetScrollPercent' $target ([pscustomobject]@{ horizontal = -0.5; vertical = 100 })) }
+    }
+    Test-Case 'Reject non-finite numeric value' { Test-ExpectThrow { Assert-Step (New-Step 'SetRange' $target ([pscustomobject]@{ value = 'NaN' })) } }
+    Test-Case 'Variables replace multiple occurrences and preserve blanks' {
+        $v = Get-Variables $document ''; $text = Expand-Data '${Customer}-${Customer}-${Empty}' $v
+        Assert-That ($text -ceq 'Mira-Mira-') 'Incorrect expansion.'
+    }
+    Test-Case 'Missing variables fail before execution' { Test-ExpectThrow { Resolve-StepData $document.steps[0] @{} } }
+    Test-Case 'Variable text is literal, never recursively evaluated' {
+        $value = '$(throw 123); ${Other}; `n; $1'
+        Assert-That ((Expand-Data '${X}' @{ X = $value }) -ceq $value) 'Variable was interpreted.'
+    }
+    Test-Case 'Variable expansion preserves path arrays and original source' {
+        $s = Resolve-StepData $document.steps[0] @{ Customer = 'Changed' }
+        Assert-That ($s.arguments.value -ceq 'Changed' -and $s.target.path -is [array]) 'Expansion failed.'
+        Assert-That ($document.steps[0].arguments.value -ceq '${Customer}') 'Original mutated.'
+    }
+    Test-Case 'Expansion cannot rewrite the step action or identity' {
+        $s = Copy-Data $document.steps[0]; $s.id = '${Customer}'; $s.label = '${Customer}'
+        $expanded = Resolve-StepData $s @{ Customer = 'Changed' }
+        Assert-That ($expanded.id -ceq '${Customer}' -and $expanded.action -ceq 'SetValue') 'Control fields expanded.'
+    }
+    Test-Case 'Expanded numeric parameters are range-validated' {
+        $s = New-Step 'SetRange' $target ([pscustomobject]@{ value = '${Amount}' })
+        Assert-That ((Resolve-StepData $s @{ Amount = '1.5' }).arguments.value -ceq '1.5') 'Numeric substitution failed.'
+        Test-ExpectThrow { Resolve-StepData $s @{ Amount = 'NaN' } }
+        Test-ExpectThrow { Resolve-StepData $s @{ Amount = '${Unresolved}' } }
+    }
+    Test-Case 'Reject malformed variable names and non-string values' {
+        Test-ExpectThrow { Assert-Variables ([pscustomobject]@{ 'bad-name' = 'x' }) }
+        Test-ExpectThrow { Assert-Variables ([pscustomobject]@{ Good = 123 }) }
+    }
+    Test-Case 'Assertions use literal case-sensitive comparison' {
+        Assert-That (Test-Assertion 'abc*' ([pscustomobject]@{ operator = 'Equals'; expected = 'abc*' })) 'Literal equality failed.'
+        Assert-That (-not (Test-Assertion 'ABC' ([pscustomobject]@{ operator = 'Equals'; expected = 'abc' }))) 'Comparison was not ordinal.'
+        Assert-That (Test-Assertion 'abc.def' ([pscustomobject]@{ operator = 'Contains'; expected = '.' })) 'Literal contains failed.'
+        Assert-That (Test-Assertion 'abc' ([pscustomobject]@{ operator = 'NotEquals'; expected = 'def' })) 'NotEquals failed.'
+    }
+    Test-Case 'Worker deadlines include startup and response grace' {
+        $s = New-Step 'Delay' $null ([pscustomobject]@{ milliseconds = 20000 })
+        Assert-That ((Get-StepLimit $s) -eq 30000) 'Delay deadline wrong.'
+        Assert-That ((Get-StepLimit $document.steps[0]) -eq 20000) 'Action deadline wrong.'
+    }
+    Test-Case 'Result report excludes targets, argument values and variables' {
+        $r = New-Result $document.steps[0] 0 'Passed' 'Completed' 2
+        $report = New-Report $document @($r) $false 'Passed'
+        $json = $report | ConvertTo-Json -Depth 80
+        Assert-That ($report.results.Count -eq 1 -and $json -notmatch 'arguments|variables|automationId') 'Report leaked input data.'
+    }
+    $tempFolder = Join-Path ([IO.Path]::GetTempPath()) ('DTORadarTests-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($tempFolder)
+    try {
+        Test-Case 'Atomic save creates and replaces valid UTF-8 JSON' {
+            $path = Join-Path $tempFolder 'roundtrip.psrec'; Write-Json $path $document
+            $d = Read-Json $path; Assert-Recording $d
+            $d.name = 'Updated'; $d.description = 'Unicode ' + [char]0x00F1 + [char]0x4E2D; Write-Json $path $d
+            $saved = Read-Json $path
+            Assert-That ($saved.name -ceq 'Updated' -and $saved.description -ceq $d.description) 'Save or Unicode round trip failed.'
+        }
+        Test-Case 'Override variables win without mutating the recording' {
+            $path = Join-Path $tempFolder 'variables.json'; Write-Json $path ([pscustomobject]@{ Customer = 'Override' })
+            $v = Get-Variables $document $path
+            Assert-That ($v.Customer -ceq 'Override' -and $document.variables.Customer -ceq 'Mira') 'Override behavior wrong.'
+        }
+        Test-Case 'Reject malformed JSON' {
+            $path = Join-Path $tempFolder 'broken.json'; [IO.File]::WriteAllText($path,'{broken')
+            Test-ExpectThrow { Read-Json $path }
+        }
+        Test-Case 'Worker response is preferred to process exit' {
+            $path = Join-Path $tempFolder 'response.json'; Write-Json $path ([pscustomobject]@{ ok = $true; message = 'Completed'; data = $null; elapsedMs = 1 })
+            $fake = [pscustomobject]@{ response = $path; process = [pscustomobject]@{ HasExited = $true; ExitCode = 0 } }
+            Assert-That (Get-WorkerResult $fake).ok 'Valid response ignored.'
+        }
+        Test-Case 'Worker crash produces a failure result' {
+            $fake = [pscustomobject]@{ response = (Join-Path $tempFolder 'missing.json'); process = [pscustomobject]@{ HasExited = $true; ExitCode = 12 }; clock = [pscustomobject]@{ ElapsedMilliseconds = 3 } }
+            Assert-That (-not (Get-WorkerResult $fake).ok) 'Crash was not reported.'
+        }
+        Test-Case 'Worker timeout is explicit about unknown action outcome' {
+            $fake = [pscustomobject]@{ response = (Join-Path $tempFolder 'missing.json'); process = [pscustomobject]@{ HasExited = $false }; clock = [pscustomobject]@{ ElapsedMilliseconds = 100 }; limitMs = 50 }
+            $result = Get-WorkerResult $fake
+            Assert-That (-not $result.ok -and $result.message -match 'unknown') 'Timeout lost uncertainty.'
+        }
+    } finally { Remove-Item -LiteralPath $tempFolder -Recurse -Force }
+
+    # Mock only the UIA boundary. Exercise the actual wait/action control flow.
+    $script:MockFindCalls = 0; $script:MockActions = 0; $script:MockNotReady = 0; $script:MockActionThrows = $false
+    $script:MockElement = [pscustomobject]@{ Current = [pscustomobject]@{ IsEnabled = $true; IsPassword = $false; Name = 'Ready' } }
+    $script:MockPattern = [pscustomobject]@{ Current = [pscustomobject]@{ IsReadOnly = $false; Value = 'Ready'; Minimum = 0; Maximum = 100 } }
+    $script:MockPattern | Add-Member ScriptMethod SetValue { param($v) $script:MockActions++; if ($script:MockActionThrows) { throw 'Provider failed after submission.' } }
+    function Find-Target($Target) { $script:MockFindCalls++; if ($script:MockFindCalls -le $script:MockNotReady) { throw 'Not ready.' }; return $script:MockElement }
+    function Get-Pattern($Element, [string]$Name) { return $script:MockPattern }
+    Test-Case 'Playback waits for readiness then submits the action once' {
+        $script:MockFindCalls = 0; $script:MockActions = 0; $script:MockNotReady = 1
+        $s = Resolve-StepData $document.steps[0] @{ Customer = 'Test' }; $s.timeoutMs = 1000
+        Invoke-UiaStep $s $false
+        Assert-That ($script:MockFindCalls -eq 2 -and $script:MockActions -eq 1) 'Readiness/action sequence wrong.'
+    }
+    Test-Case 'Dry run checks readiness without sending the action' {
+        $script:MockNotReady = 0; $script:MockActions = 0
+        Invoke-UiaStep (Resolve-StepData $document.steps[0] @{ Customer = 'Test' }) $true
+        Assert-That ($script:MockActions -eq 0) 'Dry run submitted an action.'
+    }
+    Test-Case 'Provider action failure is never retried' {
+        $script:MockActions = 0; $script:MockActionThrows = $true
+        Test-ExpectThrow { Invoke-UiaStep (Resolve-StepData $document.steps[0] @{ Customer = 'Test' }) $false }
+        Assert-That ($script:MockActions -eq 1) 'Failed action was repeated.'
+        $script:MockActionThrows = $false
+    }
+    Test-Case 'Target timeout submits no action' {
+        $script:MockFindCalls = 0; $script:MockActions = 0; $script:MockNotReady = 999
+        $s = Resolve-StepData $document.steps[0] @{ Customer = 'Test' }; $s.timeoutMs = 100
+        Test-ExpectThrow { Invoke-UiaStep $s $false }
+        Assert-That ($script:MockActions -eq 0) 'Action sent without a ready target.'
+        $script:MockNotReady = 0
+    }
+    Test-Case 'Password property read is rejected' {
+        $script:MockElement.Current.IsPassword = $true
+        Test-ExpectThrow { Get-UiaProperty $script:MockElement 'Value' }
+        $script:MockElement.Current.IsPassword = $false
+    }
+    Write-Host ("`nTests: {0} passed, {1} failed. Live Windows UIA/GUI tests are separate." -f $script:TestPassed,$script:TestFailed)
+    if ($script:TestFailed -gt 0) { exit 1 }
+    exit 0
+}
+
+try {
+    if ($SelfTest) { Invoke-SelfTests }
+    Assert-That ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSEdition -eq 'Desktop') 'Run with Windows PowerShell 5.1 (powershell.exe), not pwsh, on Windows. -SelfTest can also run under PowerShell 7.'
+    Assert-That ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') 'This application needs FullLanguage PowerShell to use the Windows UI and UI Automation APIs.'
+    if ($Worker) { Invoke-Worker; exit 0 }
+    if ($Play) { Invoke-ConsolePlayback }
+    Assert-That ([Threading.Thread]::CurrentThread.ApartmentState -eq 'STA') 'Start the UI with: powershell.exe -NoProfile -STA -File .\DTORadarRecorder.ps1'
+    if ($Demo) { Show-DemoWindow } else { Show-Recorder }
+} catch {
+    Write-Error $_.Exception.Message -ErrorAction Continue
+    exit 1
+}
